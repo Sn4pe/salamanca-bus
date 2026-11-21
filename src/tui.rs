@@ -242,13 +242,105 @@ struct Basemap {
     river: Vec<Vec<Point>>,
     main: Vec<Vec<Point>>,
     minor: Vec<Vec<Point>>,
+    streets: Vec<Vec<Point>>,
+}
+
+/// A moved or zoomed Map tab: `height` degrees of latitude around `centre`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct View {
+    centre: Point,
+    height: f64,
+}
+
+/// About 170 m to 11 km tall, centre kept over the basemap so the city can't be lost.
+const MIN_HEIGHT: f64 = 0.0015;
+const MAX_HEIGHT: f64 = 0.1;
+const AREA_LON: [f64; 2] = [-5.745, -5.615];
+const AREA_LAT: [f64; 2] = [40.925, 40.995];
+/// Below these degrees of longitude per column the map adds streets, then stop numbers.
+const STREETS_FROM: f64 = 0.0006;
+const STOP_NUMBERS_FROM: f64 = 0.00012;
+
+impl View {
+    fn clamped(self) -> View {
+        View {
+            centre: (
+                self.centre.0.clamp(AREA_LON[0], AREA_LON[1]),
+                self.centre.1.clamp(AREA_LAT[0], AREA_LAT[1]),
+            ),
+            height: self.height.clamp(MIN_HEIGHT, MAX_HEIGHT),
+        }
+    }
+
+    fn bounds(self, area: Rect) -> ([f64; 2], [f64; 2]) {
+        let shrink = self.centre.1.to_radians().cos();
+        let wanted = (f64::from(area.width.max(1)) * 2.0) / (f64::from(area.height.max(1)) * 4.0);
+        let half_lon = self.height * wanted / shrink / 2.0;
+        let (lon, lat) = self.centre;
+        (
+            [lon - half_lon, lon + half_lon],
+            [lat - self.height / 2.0, lat + self.height / 2.0],
+        )
+    }
+
+    /// Zoomed by `factor` (below 1 is closer) keeping `at` where it is on screen.
+    fn zoomed(self, factor: f64, at: Point) -> View {
+        let height = (self.height * factor).clamp(MIN_HEIGHT, MAX_HEIGHT);
+        let f = height / self.height;
+        View {
+            centre: (
+                at.0 + (self.centre.0 - at.0) * f,
+                at.1 + (self.centre.1 - at.1) * f,
+            ),
+            height,
+        }
+        .clamped()
+    }
+}
+
+/// The map's inner area and the bounds it was last drawn with.
+#[derive(Clone, Copy)]
+struct MapFrame {
+    area: Rect,
+    lon: [f64; 2],
+    lat: [f64; 2],
+}
+
+impl MapFrame {
+    fn view(self) -> View {
+        View {
+            centre: (
+                (self.lon[0] + self.lon[1]) / 2.0,
+                (self.lat[0] + self.lat[1]) / 2.0,
+            ),
+            height: self.lat[1] - self.lat[0],
+        }
+    }
+
+    /// Degrees per column and per row.
+    fn cell(self) -> (f64, f64) {
+        (
+            (self.lon[1] - self.lon[0]) / f64::from(self.area.width.max(1)),
+            (self.lat[1] - self.lat[0]) / f64::from(self.area.height.max(1)),
+        )
+    }
+
+    /// The place under the middle of a cell; rows run down while latitude runs up.
+    fn point(self, at: Position) -> Point {
+        let (w, h) = self.cell();
+        (
+            self.lon[0] + (f64::from(at.x - self.area.x) + 0.5) * w,
+            self.lat[1] - (f64::from(at.y - self.area.y) + 0.5) * h,
+        )
+    }
 }
 
 /// What `draw_city` puts on a map, bottom layer first.
 #[derive(Default)]
 struct City<'a> {
-    /// The map is fitted to these.
+    /// The map is fitted to these, unless the user has moved it.
     focus: &'a [Point],
+    view: Option<View>,
     dots: &'a [Point],
     bright: &'a [Point],
     bright_colour: Color,
@@ -270,6 +362,11 @@ struct App {
     /// When the bus on the Paradas tab was first shown: its animation runs from here.
     bus_since: Option<Instant>,
     palette: Option<Palette>,
+    /// The Map tab's view once moved or zoomed; `None` fits it to what is shown.
+    view: Option<View>,
+    map_frame: Option<MapFrame>,
+    /// Where a drag on the map started, and the view then.
+    drag: Option<(Position, View)>,
 }
 
 pub fn run(client: Client) -> io::Result<()> {
@@ -319,6 +416,9 @@ pub fn run(client: Client) -> io::Result<()> {
         mouse: None,
         bus_since: None,
         palette: None,
+        view: None,
+        map_frame: None,
+        drag: None,
     };
     let mut terminal = ratatui::init();
     // ratatui's panic hook restores the screen but leaves mouse reporting on.
@@ -413,9 +513,44 @@ impl App {
     fn on_mouse(&mut self, mouse: MouseEvent) -> bool {
         let at = Position::new(mouse.column, mouse.row);
         self.mouse = Some(at);
+        let on_map = self.shared.lock().unwrap().tab == Tab::Map;
+        let over_map =
+            on_map && self.palette.is_none() && self.map_frame.is_some_and(|m| m.area.contains(at));
         match mouse.kind {
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp if over_map => {
+                let closer = mouse.kind == MouseEventKind::ScrollUp;
+                self.zoom(if closer { 0.8 } else { 1.25 }, Some(at));
+                false
+            }
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
+                if on_map && self.palette.is_none() =>
+            {
+                self.cycle_line(mouse.kind == MouseEventKind::ScrollDown);
+                false
+            }
             MouseEventKind::ScrollDown => self.on_key(KeyCode::Down.into()),
             MouseEventKind::ScrollUp => self.on_key(KeyCode::Up.into()),
+            MouseEventKind::Down(MouseButton::Left) if over_map => {
+                self.drag = self.map_frame.map(|m| (at, self.view.unwrap_or(m.view())));
+                false
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                // A click without movement leaves the view as it was.
+                if let (Some((from, start)), Some(m)) = (self.drag, self.map_frame)
+                    && at != from
+                {
+                    let (w, h) = m.cell();
+                    let dx = f64::from(at.x) - f64::from(from.x);
+                    let dy = f64::from(at.y) - f64::from(from.y);
+                    let centre = (start.centre.0 - dx * w, start.centre.1 + dy * h);
+                    self.view = Some(View { centre, ..start }.clamped());
+                }
+                false
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.drag = None;
+                false
+            }
             MouseEventKind::Down(MouseButton::Left) if self.palette.is_some() => {
                 // Nothing under the palette takes the click: outside it, the click only closes it.
                 let hit = self.hits.iter().rev().find(|(rect, _)| rect.contains(at));
@@ -447,7 +582,10 @@ impl App {
                     }
                     Some(Hit::Result(i)) => self.results.select(Some(i)),
                     Some(Hit::Favourite(i)) => self.selected = i,
-                    Some(Hit::Line(line)) => self.line = line,
+                    Some(Hit::Line(line)) => {
+                        self.line = line;
+                        self.view = None;
+                    }
                     Some(Hit::Palette) => self.palette = Some(Palette::default()),
                     Some(Hit::Command(_)) | None => {}
                 }
@@ -526,21 +664,54 @@ impl App {
             }
 
             (Tab::Map, KeyCode::Down | KeyCode::Right | KeyCode::Up | KeyCode::Left) => {
-                // Cycle: all → each line with a bus on the road → all.
-                let mut options: Vec<Option<String>> = vec![None];
-                options.extend(
-                    lines_on_road(&s.positions)
-                        .into_iter()
-                        .map(|(line, _, _)| Some(line)),
-                );
-                let at = options.iter().position(|o| *o == self.line).unwrap_or(0);
-                let forward = matches!(key.code, KeyCode::Down | KeyCode::Right);
-                let step = if forward { 1 } else { options.len() - 1 };
-                self.line = options[(at + step) % options.len()].clone();
+                drop(s);
+                self.cycle_line(matches!(key.code, KeyCode::Down | KeyCode::Right));
+            }
+            (Tab::Map, KeyCode::Char('+' | '=')) => self.zoom(0.8, None),
+            (Tab::Map, KeyCode::Char('-')) => self.zoom(1.25, None),
+            (Tab::Map, KeyCode::Char('0')) => self.view = None,
+            (Tab::Map, KeyCode::Char(c @ ('w' | 'a' | 's' | 'd' | 'W' | 'A' | 'S' | 'D'))) => {
+                if let Some(view) = self.view.or(self.map_frame.map(MapFrame::view)) {
+                    // A quarter of the map per press.
+                    let (step_lon, step_lat) = self.map_frame.map_or((0.0, 0.0), |m| {
+                        ((m.lon[1] - m.lon[0]) / 4.0, (m.lat[1] - m.lat[0]) / 4.0)
+                    });
+                    let (dx, dy) = match c.to_ascii_lowercase() {
+                        'a' => (-step_lon, 0.0),
+                        'd' => (step_lon, 0.0),
+                        'w' => (0.0, step_lat),
+                        _ => (0.0, -step_lat),
+                    };
+                    let centre = (view.centre.0 + dx, view.centre.1 + dy);
+                    self.view = Some(View { centre, ..view }.clamped());
+                }
             }
             _ => {}
         }
         false
+    }
+
+    /// All lines, then each line with a bus on the road, then all again.
+    fn cycle_line(&mut self, forward: bool) {
+        let s = self.shared.lock().unwrap();
+        let mut options: Vec<Option<String>> = vec![None];
+        options.extend(
+            lines_on_road(&s.positions)
+                .into_iter()
+                .map(|(line, _, _)| Some(line)),
+        );
+        let at = options.iter().position(|o| *o == self.line).unwrap_or(0);
+        let step = if forward { 1 } else { options.len() - 1 };
+        self.line = options[(at + step) % options.len()].clone();
+        self.view = None;
+    }
+
+    /// Around the pointer when there is one over the map, else around the middle.
+    fn zoom(&mut self, factor: f64, at: Option<Position>) {
+        let Some(m) = self.map_frame else { return };
+        let view = self.view.unwrap_or(m.view());
+        let at = at.map_or(view.centre, |at| m.point(at));
+        self.view = Some(view.zoomed(factor, at));
     }
 
     /// Returns true to quit.
@@ -742,8 +913,9 @@ impl App {
             ],
             Tab::Map => vec![
                 ("↑↓", tr("línea", "line"), KeyCode::Down),
-                ("r", tr("actualizar", "refresh"), KeyCode::Char('r')),
-                ("tab", tr("paradas", "stops"), KeyCode::Tab),
+                ("wasd", tr("mover", "move"), KeyCode::Char('d')),
+                ("+−", "zoom", KeyCode::Char('+')),
+                ("0", tr("centrar", "reset"), KeyCode::Char('0')),
                 ("q", tr("salir", "quit"), KeyCode::Char('q')),
             ],
         };
@@ -1195,7 +1367,11 @@ impl App {
             .collect();
         labels.extend(vehicles.iter().map(|v| {
             // Each bus is its line number. Following one line there is room for its heading too.
+            let close = self.view.is_some_and(|v| v.height < 0.01);
             let label = match self.line {
+                _ if close => {
+                    Span::styled(format!(" {} {}", v.line, heading(v)), badge(&v.line).style)
+                }
                 Some(_) => {
                     Span::styled(format!(" {} {}", v.line, heading(v)), badge(&v.line).style)
                 }
@@ -1247,13 +1423,14 @@ impl App {
             .title_bottom(Line::from("© OpenStreetMap ").fg(t.muted).right_aligned());
         let city = City {
             focus: if of_line.is_empty() { &core } else { &of_line },
+            view: self.view,
             dots: &everything,
             bright: &of_line,
             bright_colour: line_colour(self.line.as_deref().unwrap_or("")),
             trails,
             labels,
         };
-        self.draw_city(frame, map, block, city);
+        self.map_frame = Some(self.draw_city(frame, map, block, city));
 
         let Some(side) = side else { return };
         let block = panel(tr("Líneas en servicio", "Lines running"), false);
@@ -1301,10 +1478,13 @@ impl App {
     }
 
     /// City map: roads and river, stop dots, highlighted stops, trails, then labels on top.
-    fn draw_city(&self, frame: &mut Frame, area: Rect, block: Block, city: City) {
+    fn draw_city(&self, frame: &mut Frame, area: Rect, block: Block, city: City) -> MapFrame {
         let t = theme();
         let inner = block.inner(area);
-        let (x_bounds, y_bounds) = fit(city.focus, inner);
+        let (x_bounds, y_bounds) = match city.view {
+            Some(view) => view.bounds(inner),
+            None => fit(city.focus, inner),
+        };
         // Labels are drawn from their left edge; nudge them so they sit on the point.
         let cell = (x_bounds[1] - x_bounds[0]) / f64::from(inner.width.max(1));
         let canvas = Canvas::default()
@@ -1314,10 +1494,16 @@ impl App {
             .x_bounds(x_bounds)
             .y_bounds(y_bounds)
             .paint(|ctx| {
+                let streets: &[Vec<Point>] = if cell < STREETS_FROM {
+                    &self.basemap.streets
+                } else {
+                    &[]
+                };
                 for (lines, colour) in [
-                    (&self.basemap.minor, t.road_minor),
-                    (&self.basemap.main, t.road),
-                    (&self.basemap.river, t.river),
+                    (streets, t.road_minor),
+                    (&self.basemap.minor[..], t.road_minor),
+                    (&self.basemap.main[..], t.road),
+                    (&self.basemap.river[..], t.river),
                 ] {
                     for pair in lines.iter().flat_map(|line| line.windows(2)) {
                         ctx.draw(&Segment::new(
@@ -1341,6 +1527,13 @@ impl App {
                     coords: city.bright,
                     color: city.bright_colour,
                 });
+                if cell < STOP_NUMBERS_FROM {
+                    for stop in &self.stops {
+                        if let Some((lon, lat)) = point(stop) {
+                            ctx.print(lon + cell, lat, stop.id.clone().fg(t.muted));
+                        }
+                    }
+                }
                 // Zoomed out to the whole network the names would sit on top of each other.
                 let places = if cell < 0.0015 { &LANDMARKS[..] } else { &[] };
                 for &(es, en, lon, lat) in places {
@@ -1354,6 +1547,11 @@ impl App {
                 }
             });
         frame.render_widget(canvas, area);
+        MapFrame {
+            area: inner,
+            lon: x_bounds,
+            lat: y_bounds,
+        }
     }
 }
 
@@ -1696,4 +1894,27 @@ fn save_favourites(favourites: &[String]) {
         let _ = fs::create_dir_all(dir);
     }
     let _ = fs::write(path, serde_json::to_string(favourites).unwrap_or_default());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zoom_keeps_the_place_under_the_pointer() {
+        let area = Rect::new(10, 5, 80, 30);
+        let view = View {
+            centre: (-5.664, 40.965),
+            height: 0.04,
+        };
+        let frame = |v: View| {
+            let (lon, lat) = v.bounds(area);
+            MapFrame { area, lon, lat }
+        };
+        let pointer = Position::new(30, 12);
+        let before = frame(view).point(pointer);
+        let after = frame(view.zoomed(0.5, before)).point(pointer);
+        assert!((before.0 - after.0).abs() < 1e-5 && (before.1 - after.1).abs() < 1e-5);
+        assert_eq!(view.zoomed(1e-6, before).height, MIN_HEIGHT);
+    }
 }

@@ -89,6 +89,20 @@ static TRUECOLOR: LazyLock<bool> = LazyLock::new(|| {
     std::env::var("COLORTERM").is_ok_and(|v| v.contains("truecolor") || v.contains("24bit"))
 });
 static LIGHT: AtomicBool = AtomicBool::new(false);
+static ENGLISH: AtomicBool = AtomicBool::new(false);
+
+fn tr(es: &'static str, en: &'static str) -> &'static str {
+    if ENGLISH.load(Relaxed) { en } else { es }
+}
+
+fn ago(at: Instant) -> String {
+    let secs = at.elapsed().as_secs();
+    if ENGLISH.load(Relaxed) {
+        format!("{secs} s ago")
+    } else {
+        format!("hace {secs} s")
+    }
+}
 
 static DARK_THEME: LazyLock<Theme> = LazyLock::new(|| Theme {
     bg: rgb(0x0c111d),
@@ -167,11 +181,11 @@ fn colour(hex: u32, truecolor: bool) -> Color {
 
 type Point = (f64, f64); // (lon, lat)
 
-const LANDMARKS: [(&str, f64, f64); 4] = [
-    ("Plaza Mayor", -5.6640, 40.9650),
-    ("Estación de tren", -5.6487, 40.9722),
-    ("Hospital", -5.6754, 40.9621),
-    ("Río Tormes", -5.6610, 40.9515),
+const LANDMARKS: [(&str, &str, f64, f64); 4] = [
+    ("Plaza Mayor", "Plaza Mayor", -5.6640, 40.9650),
+    ("Estación de tren", "Train station", -5.6487, 40.9722),
+    ("Hospital", "Hospital", -5.6754, 40.9621),
+    ("Río Tormes", "Tormes river", -5.6610, 40.9515),
 ];
 
 #[derive(Clone, Copy, PartialEq)]
@@ -199,6 +213,7 @@ enum Command {
     Refresh,
     Replay,
     Theme,
+    Language,
     Quit,
 }
 
@@ -218,7 +233,7 @@ struct Shared {
     /// Where each vehicle has been since the map was opened, oldest first.
     trails: HashMap<String, Vec<Point>>,
     arrivals: HashMap<String, (Instant, Vec<Arrival>)>,
-    error: Option<String>,
+    error: Option<api::Error>,
 }
 
 /// River and roads from OpenStreetMap, drawn under the stops.
@@ -258,7 +273,14 @@ struct App {
 }
 
 pub fn run(client: Client) -> io::Result<()> {
-    let light = match load_settings().theme.as_deref() {
+    let settings = load_settings();
+    let english = match settings.lang.as_deref() {
+        Some("en") => true,
+        Some("es") => false,
+        _ => !system_spanish(),
+    };
+    ENGLISH.store(english, Relaxed);
+    let light = match settings.theme.as_deref() {
         Some("light") => true,
         Some("dark") => false,
         _ => system_light(),
@@ -361,8 +383,7 @@ fn worker(client: &Client, shared: &Mutex<Shared>) {
                     .insert(key.clone(), (Instant::now(), arrivals));
             })
         }
-        .err()
-        .map(|e| e.to_string());
+        .err();
         fetched.insert(key, Instant::now());
         shared.lock().unwrap().error = error;
     }
@@ -553,18 +574,35 @@ impl App {
     /// The commands whose name matches what is typed in the palette: (command, name, key).
     fn palette_commands(&self) -> Vec<(Command, String, &'static str)> {
         let theme_name = if LIGHT.load(Relaxed) {
-            "Modo oscuro"
+            tr("Modo oscuro", "Dark mode")
         } else {
-            "Modo claro"
+            tr("Modo claro", "Light mode")
         };
         let all = [
-            (Command::Go(Tab::Stops), "Ir a Paradas", ""),
-            (Command::Go(Tab::Arrivals), "Ir a Llegadas", ""),
-            (Command::Go(Tab::Map), "Ir al Mapa", ""),
-            (Command::Refresh, "Actualizar ahora", "r"),
-            (Command::Replay, "Ver llegar el autobús", ""),
+            (
+                Command::Go(Tab::Stops),
+                tr("Ir a Paradas", "Go to Stops"),
+                "",
+            ),
+            (
+                Command::Go(Tab::Arrivals),
+                tr("Ir a Llegadas", "Go to Arrivals"),
+                "",
+            ),
+            (Command::Go(Tab::Map), tr("Ir al Mapa", "Go to Map"), ""),
+            (Command::Refresh, tr("Actualizar ahora", "Refresh now"), "r"),
+            (
+                Command::Replay,
+                tr("Ver llegar el autobús", "Watch the bus pull in"),
+                "",
+            ),
             (Command::Theme, theme_name, ""),
-            (Command::Quit, "Salir", "q"),
+            (
+                Command::Language,
+                tr("English (cambiar idioma)", "Español (change language)"),
+                "",
+            ),
+            (Command::Quit, tr("Salir", "Quit"), "q"),
         ];
         let query = self
             .palette
@@ -592,6 +630,13 @@ impl App {
                 LIGHT.store(light, Relaxed);
                 let mut settings = load_settings();
                 settings.theme = Some(if light { "light" } else { "dark" }.to_owned());
+                save_settings(&settings);
+            }
+            Command::Language => {
+                let english = !ENGLISH.load(Relaxed);
+                ENGLISH.store(english, Relaxed);
+                let mut settings = load_settings();
+                settings.lang = Some(if english { "en" } else { "es" }.to_owned());
                 save_settings(&settings);
             }
             Command::Quit => return true,
@@ -648,9 +693,9 @@ impl App {
 
         let mut top = vec![(vec!["salbus".fg(t.primary).bold(), "   ".into()], None)];
         for (tab, name) in [
-            (Tab::Stops, "Paradas"),
-            (Tab::Arrivals, "Llegadas"),
-            (Tab::Map, "Mapa"),
+            (Tab::Stops, tr("Paradas", "Stops")),
+            (Tab::Arrivals, tr("Llegadas", "Arrivals")),
+            (Tab::Map, tr("Mapa", "Map")),
         ] {
             let label = format!(" {name} ");
             let label = if tab == s.tab {
@@ -670,32 +715,36 @@ impl App {
             Tab::Map => s.positions_at,
         };
         let live = match freshest {
-            _ if s.tab == Tab::Stops => format!("{} paradas", self.stops.len()).fg(t.muted),
-            Some(at) if at.elapsed() < Duration::from_secs(90) => "● en vivo".fg(t.success),
-            Some(_) => "● datos viejos".fg(t.warning),
-            None => "○ cargando…".fg(t.muted),
+            _ if s.tab == Tab::Stops => {
+                format!("{} {}", self.stops.len(), tr("paradas", "stops")).fg(t.muted)
+            }
+            Some(at) if at.elapsed() < Duration::from_secs(90) => {
+                tr("● en vivo", "● live").fg(t.success)
+            }
+            Some(_) => tr("● datos viejos", "● stale data").fg(t.warning),
+            None => tr("○ cargando…", "○ loading…").fg(t.muted),
         };
         frame.render_widget(Line::from(live).right_aligned(), header.inner(padded));
 
-        let hints: &[(&str, &str, KeyCode)] = match s.tab {
-            Tab::Stops => &[
-                ("↑↓", "elegir", KeyCode::Down),
-                ("enter", "guardar parada", KeyCode::Enter),
-                ("tab", "llegadas", KeyCode::Tab),
-                ("esc", "salir", KeyCode::Esc),
+        let hints: Vec<(&str, &str, KeyCode)> = match s.tab {
+            Tab::Stops => vec![
+                ("↑↓", tr("elegir", "choose"), KeyCode::Down),
+                ("enter", tr("guardar parada", "save stop"), KeyCode::Enter),
+                ("tab", tr("llegadas", "arrivals"), KeyCode::Tab),
+                ("esc", tr("salir", "quit"), KeyCode::Esc),
             ],
-            Tab::Arrivals => &[
-                ("↑↓", "parada", KeyCode::Down),
-                ("d", "quitar", KeyCode::Char('d')),
-                ("r", "actualizar", KeyCode::Char('r')),
-                ("tab", "mapa", KeyCode::Tab),
-                ("q", "salir", KeyCode::Char('q')),
+            Tab::Arrivals => vec![
+                ("↑↓", tr("parada", "stop"), KeyCode::Down),
+                ("d", tr("quitar", "remove"), KeyCode::Char('d')),
+                ("r", tr("actualizar", "refresh"), KeyCode::Char('r')),
+                ("tab", tr("mapa", "map"), KeyCode::Tab),
+                ("q", tr("salir", "quit"), KeyCode::Char('q')),
             ],
-            Tab::Map => &[
-                ("↑↓", "línea", KeyCode::Down),
-                ("r", "actualizar", KeyCode::Char('r')),
-                ("tab", "paradas", KeyCode::Tab),
-                ("q", "salir", KeyCode::Char('q')),
+            Tab::Map => vec![
+                ("↑↓", tr("línea", "line"), KeyCode::Down),
+                ("r", tr("actualizar", "refresh"), KeyCode::Char('r')),
+                ("tab", tr("paradas", "stops"), KeyCode::Tab),
+                ("q", tr("salir", "quit"), KeyCode::Char('q')),
             ],
         };
         let mut bar: Vec<(Vec<Span>, Option<Hit>)> = hints
@@ -709,10 +758,14 @@ impl App {
             })
             .collect();
         bar.push((
-            vec![" ctrl+p ".fg(t.accent).bold(), "comandos  ".fg(t.fg)],
+            vec![
+                " ctrl+p ".fg(t.accent).bold(),
+                format!("{}  ", tr("comandos", "commands")).fg(t.fg),
+            ],
             Some(Hit::Palette),
         ));
         if let Some(error) = &s.error {
+            let error = error.message(ENGLISH.load(Relaxed));
             bar.push((vec![format!(" {error}").fg(t.error)], None));
         }
         frame.render_widget(Block::new().style(Style::new().bg(t.surface)), footer);
@@ -749,8 +802,11 @@ impl App {
             height,
         };
         frame.render_widget(Clear, area);
-        let block = panel("Comandos", true)
-            .title_top(Line::from("esc cerrar ").fg(t.muted).right_aligned());
+        let block = panel(tr("Comandos", "Commands"), true).title_top(
+            Line::from(tr("esc cerrar ", "esc close "))
+                .fg(t.muted)
+                .right_aligned(),
+        );
         let inner = block.inner(area).inner(Margin::new(1, 0));
         frame.render_widget(block, area);
         let typed = format!("› {}▏", p.query);
@@ -763,7 +819,10 @@ impl App {
                 height: 1,
                 ..inner
             };
-            frame.render_widget(Line::from("Ningún comando casa".fg(t.muted)), none);
+            frame.render_widget(
+                Line::from(tr("Ningún comando casa", "No matching command").fg(t.muted)),
+                none,
+            );
         }
         for (i, (_, name, key)) in found.iter().enumerate() {
             let row = Rect {
@@ -812,7 +871,11 @@ impl App {
                 .collect();
             art.push(Line::default());
             art.push(Line::from(
-                "Autobuses urbanos de Salamanca, en vivo".fg(t.muted),
+                tr(
+                    "Autobuses urbanos de Salamanca, en vivo",
+                    "Salamanca city buses, live",
+                )
+                .fg(t.muted),
             ));
             frame.render_widget(Paragraph::new(art).centered(), hero);
             let street = Rect {
@@ -825,19 +888,30 @@ impl App {
 
         let width = usize::from(left.width).saturating_sub(10).min(56);
         let typed = if self.query.is_empty() {
-            format!(" {:<width$}", "nombre, calle o número").fg(t.muted)
+            format!(
+                " {:<width$}",
+                tr("nombre, calle o número", "name, street or number")
+            )
+            .fg(t.muted)
         } else {
             format!(" {:<width$}", format!("{}▏", self.query)).fg(t.fg)
         };
         frame.render_widget(
-            Line::from(vec!["Parada   ".fg(t.muted), typed.bg(t.field)]),
+            Line::from(vec![
+                format!("{:<9}", tr("Parada", "Stop")).fg(t.muted),
+                typed.bg(t.field),
+            ]),
             input,
         );
 
         let found = api::search(&self.stops, &self.query);
         let help = format!(
-            "{} paradas. Elige una con las flechas o el ratón.",
-            found.len()
+            "{} {}",
+            found.len(),
+            tr(
+                "paradas. Elige una con las flechas o el ratón.",
+                "stops. Pick one with the arrows or the mouse.",
+            )
         );
         frame.render_widget(Line::from(help.fg(t.muted)), count);
 
@@ -915,7 +989,7 @@ impl App {
         let Some(side) = side else { return };
         let stop = self.results.selected().and_then(|i| found.get(i));
         let everything: Vec<Point> = self.stops.iter().filter_map(point).collect();
-        let title = stop.map_or("Mapa".to_owned(), |stop| {
+        let title = stop.map_or(tr("Mapa", "Map").to_owned(), |stop| {
             format!("{} · {}", stop.id, stop.name)
         });
         let labels = stop
@@ -959,17 +1033,24 @@ impl App {
         if s.favourites.is_empty() {
             let (tab, enter) = ("tab".fg(t.accent).bold(), "enter".fg(t.accent).bold());
             let how = vec![
-                "Pulsa ".into(),
+                tr("Pulsa ", "Press ").into(),
                 tab,
-                " hasta «Paradas», busca una y pulsa ".into(),
+                tr(
+                    " hasta «Paradas», busca una y pulsa ",
+                    " until «Stops», find one and press ",
+                )
+                .into(),
                 enter,
                 ".".into(),
             ];
             let help = vec![
                 Line::default(),
-                Line::from("Aún no has guardado ninguna parada.")
-                    .bold()
-                    .centered(),
+                Line::from(tr(
+                    "Aún no has guardado ninguna parada.",
+                    "You have not saved any stop yet.",
+                ))
+                .bold()
+                .centered(),
                 Line::default(),
                 Line::from(how).fg(t.muted).centered(),
             ];
@@ -1014,8 +1095,8 @@ impl App {
                 .find(|stop| stop.id == *id)
                 .map_or("", |stop| stop.name.as_str());
             let fetched = s.arrivals.get(id);
-            let age = fetched.map_or("cargando…".to_owned(), |(at, _)| {
-                format!("hace {} s", at.elapsed().as_secs())
+            let age = fetched.map_or(tr("cargando…", "loading…").to_owned(), |(at, _)| {
+                ago(*at)
             });
             let block = panel(&format!("★ {id} · {name}"), i == self.selected)
                 .title_top(Line::from(format!("{age} ")).fg(t.muted).right_aligned());
@@ -1023,7 +1104,11 @@ impl App {
             let rows: Vec<Line> = match fetched {
                 None => vec![],
                 Some((_, list)) if list.is_empty() => {
-                    vec![" sin autobuses previstos".fg(t.muted).into()]
+                    vec![
+                        tr(" sin autobuses previstos", " no buses expected")
+                            .fg(t.muted)
+                            .into(),
+                    ]
                 }
                 Some((_, list)) => list
                     .iter()
@@ -1073,7 +1158,12 @@ impl App {
             labels,
             ..City::default()
         };
-        self.draw_city(frame, side, panel("Autobuses en camino", false), city);
+        self.draw_city(
+            frame,
+            side,
+            panel(tr("Autobuses en camino", "Buses on their way"), false),
+            city,
+        );
     }
 
     fn draw_map(&mut self, frame: &mut Frame, area: Rect, s: &Shared) {
@@ -1125,16 +1215,31 @@ impl App {
         } else {
             (area, None)
         };
-        let age = s.positions_at.map_or("cargando…".to_owned(), |at| {
-            format!("hace {} s", at.elapsed().as_secs())
-        });
+        let age = s
+            .positions_at
+            .map_or(tr("cargando…", "loading…").to_owned(), ago);
         let title = match &self.line {
-            Some(line) => format!("Línea {line} · {} autobuses", vehicles.len()),
-            None => format!("Salamanca · {} autobuses", vehicles.len()),
+            Some(line) => format!(
+                "{} {line} · {} {}",
+                tr("Línea", "Line"),
+                vehicles.len(),
+                tr("autobuses", "buses")
+            ),
+            None => format!(
+                "Salamanca · {} {}",
+                vehicles.len(),
+                tr("autobuses", "buses")
+            ),
         };
         let key = match self.line {
-            Some(_) => " → en marcha   ● parado   ★ parada guardada",
-            None => " número = línea del autobús   ★ parada guardada",
+            Some(_) => tr(
+                " → en marcha   ● parado   ★ parada guardada",
+                " → moving   ● stopped   ★ saved stop",
+            ),
+            None => tr(
+                " número = línea del autobús   ★ parada guardada",
+                " number = the bus's line   ★ saved stop",
+            ),
         };
         let block = panel(&title, false)
             .title_top(Line::from(format!("{age} ")).fg(t.muted).right_aligned())
@@ -1151,13 +1256,13 @@ impl App {
         self.draw_city(frame, map, block, city);
 
         let Some(side) = side else { return };
-        let block = panel("Líneas en servicio", false);
+        let block = panel(tr("Líneas en servicio", "Lines running"), false);
         let inner = block.inner(side);
         let on_road = lines_on_road(&s.positions);
         let mut entries = vec![(
             None,
             "    ".into(),
-            "Todas las líneas".to_owned(),
+            tr("Todas las líneas", "All lines").to_owned(),
             s.positions.len(),
         )];
         entries.extend(on_road.into_iter().map(|(line, name, buses)| {
@@ -1238,7 +1343,8 @@ impl App {
                 });
                 // Zoomed out to the whole network the names would sit on top of each other.
                 let places = if cell < 0.0015 { &LANDMARKS[..] } else { &[] };
-                for &(name, lon, lat) in places {
+                for &(es, en, lon, lat) in places {
+                    let name = tr(es, en);
                     let shift = cell * (name.chars().count() as f64) / 2.0;
                     ctx.print(lon - shift, lat, name.fg(t.stop).italic());
                 }
@@ -1319,7 +1425,7 @@ fn arrival_row(a: &Arrival, now: i64, width: usize) -> Line<'static> {
     let t = theme();
     let minutes = a.expected_epoch.map(|e| api::minutes_until(e, now));
     let (eta, eta_colour) = match minutes {
-        Some(0) => ("llegando".to_owned(), t.success),
+        Some(0) => (tr("llegando", "arriving").to_owned(), t.success),
         Some(m) if m <= 2 => (format!("{m} min"), t.success),
         Some(m) if m <= 6 => (format!("{m} min"), t.warning),
         Some(m) => (format!("{m} min"), t.fg),
@@ -1519,6 +1625,8 @@ fn favourites_path() -> Option<PathBuf> {
 struct Settings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     theme: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lang: Option<String>,
 }
 
 fn load_settings() -> Settings {
@@ -1536,6 +1644,27 @@ fn save_settings(settings: &Settings) {
         let _ = fs::create_dir_all(dir);
     }
     let _ = fs::write(path, serde_json::to_string(settings).unwrap_or_default());
+}
+
+/// The locale variables first; if none says a language, macOS's preferred languages.
+fn system_spanish() -> bool {
+    let locale = ["LC_ALL", "LC_MESSAGES", "LANG"]
+        .iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .find(|v| !v.is_empty() && v != "C" && v != "POSIX" && !v.starts_with("C."));
+    if let Some(locale) = locale {
+        return locale.starts_with("es");
+    }
+    cfg!(target_os = "macos")
+        && std::process::Command::new("defaults")
+            .args(["read", "-g", "AppleLanguages"])
+            .output()
+            .is_ok_and(|out| {
+                let text = String::from_utf8_lossy(&out.stdout);
+                text.split('"')
+                    .nth(1)
+                    .is_some_and(|first| first.starts_with("es"))
+            })
 }
 
 /// macOS's appearance setting; dark anywhere else, or if it cannot be read.

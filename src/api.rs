@@ -16,7 +16,7 @@ const BACKOFF_SECS: [u64; 2] = [8, 16];
 /// A 403 is Cloudflare's wall for the whole IP. Send nothing for this long.
 const BLOCK_PAUSE: Duration = Duration::from_secs(300);
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Error {
     Blocked,
     RateLimited,
@@ -25,18 +25,33 @@ pub enum Error {
     Body(String),
 }
 
+impl Error {
+    pub fn message(&self, english: bool) -> String {
+        match (self, english) {
+            (Error::Blocked, false) => {
+                "bloqueado por la web (403); sin peticiones durante 5 min".to_owned()
+            }
+            (Error::Blocked, true) => "blocked by the site (403); no requests for 5 min".to_owned(),
+            (Error::RateLimited, false) => {
+                "demasiadas peticiones (429); prueba en un minuto".to_owned()
+            }
+            (Error::RateLimited, true) => {
+                "too many requests (429); try again in a minute".to_owned()
+            }
+            (Error::Http(code), false) => format!("la web respondió HTTP {code}"),
+            (Error::Http(code), true) => format!("the site answered HTTP {code}"),
+            (Error::Network(e), false) => format!("fallo de red: {e}"),
+            (Error::Network(e), true) => format!("network error: {e}"),
+            (Error::Body(e), false) => format!("respuesta inesperada de la web: {e}"),
+            (Error::Body(e), true) => format!("unexpected answer from the site: {e}"),
+        }
+    }
+}
+
+/// The CLI speaks Spanish.
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Error::Blocked => write!(
-                f,
-                "bloqueado por la web (403); sin peticiones durante 5 min"
-            ),
-            Error::RateLimited => write!(f, "demasiadas peticiones (429); prueba en un minuto"),
-            Error::Http(code) => write!(f, "la web respondió HTTP {code}"),
-            Error::Network(e) => write!(f, "fallo de red: {e}"),
-            Error::Body(e) => write!(f, "respuesta inesperada de la web: {e}"),
-        }
+        f.write_str(&self.message(false))
     }
 }
 

@@ -1,0 +1,1301 @@
+//! Terminal UI: stop search, live arrivals and live bus map, by keyboard or mouse.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
+use std::{fs, io, thread};
+
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::crossterm::execute;
+use ratatui::layout::{Constraint, Layout, Margin, Position, Rect};
+use ratatui::style::{Color, Style, Stylize};
+use ratatui::symbols::Marker;
+use ratatui::text::{Line, Span};
+use ratatui::widgets::canvas::{Canvas, Line as Segment, Points};
+use ratatui::widgets::{Block, List, ListState, Paragraph};
+use ratatui::{DefaultTerminal, Frame};
+use serde::Deserialize;
+
+use crate::api::{self, Arrival, Client, Stop, Vehicle};
+
+/// The official map refreshes at this pace.
+const POSITIONS_EVERY: Duration = Duration::from_secs(5);
+const ARRIVALS_EVERY: Duration = Duration::from_secs(30);
+const ARRIVALS_SHOWN: usize = 6;
+const TRAIL_POINTS: usize = 24;
+/// Arrival rows keep their destination at this width; the side panel only fits beyond it.
+const MAIN_WIDTH: u16 = 78;
+const WIDE: u16 = MAIN_WIDTH + 38;
+/// The map's line legend needs less.
+const LEGEND_FROM: u16 = 100;
+
+const WORDMARK: [&str; 3] = [
+    "█▀▀▀ █▀▀█ █    █▀▀▄ █  █ █▀▀▀",
+    "▀▀▀█ █▀▀█ █    █▀▀▄ █  █ ▀▀▀█",
+    "▄▄▄█ █  █ █▄▄▄ █▄▄▀ █▄▄█ ▄▄▄█",
+];
+/// Pixel art, two pixels per cell, palette in `sprite_colour`; the bus faces the stop sign.
+const BUS: [&str; 14] = [
+    ".........DDDDDDDDDDDD...................",
+    "..BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB..",
+    ".BBBBBBBBBBBBBBBBBBBBBBBBSAASAASASASBBB.",
+    ".BBBBBBBBBBBBBBBBBBBBBBBBSASASAASAASBBB.",
+    ".BWWWWBWWWWWBddiddBWWWWWBWWWWWBddiddBWW.",
+    ".BWWWWBWWWWWBddiddBWWWWWBWWWWWBddiddBWW.",
+    ".BWWWWBWWWWWBddiddBWWWWWBWWWWWBddiddBWW.",
+    ".BWWWWBWWWWWBddiddBWWWWWBWWWWWBddiddBWW.",
+    ".LLLLLLLLLLLLddiddLLLLLLLLLLLLLddiddLLL.",
+    ".TBBBBBBBBBBBddiddBBBBBBBBBBBBBddiddBBA.",
+    ".BBBBBBBKKBBBBBBBBBBBBBBBBBBKKBBBBBBBBB.",
+    ".DDDDDDKHHKDDDDDDDDDDDDDDDKHHKDDDDDDDDD.",
+    ".......KHHK...............KHHK..........",
+    "........KK.................KK...........",
+];
+const STOP_SIGN: [&str; 14] = [
+    ".....", "LLLLL", "LBBBL", "LBBBL", "LLLLL", "..P..", "..P..", "..P..", "..P..", "..P..",
+    "..P..", "..P..", "..P..", "..P..",
+];
+const BUS_WIDTH: i32 = 40;
+/// The bus, a gap, the sign.
+const SCENE_WIDTH: i32 = BUS_WIDTH + 2 + 5;
+const DRIVE: Duration = Duration::from_millis(1800);
+const DOORS_OPEN: Duration = Duration::from_millis(2300);
+
+/// Own background, so it looks the same on any terminal theme; blues from the operator's site.
+struct Theme {
+    truecolor: bool,
+    bg: Color,
+    surface: Color,
+    panel: Color,
+    field: Color,
+    fg: Color,
+    muted: Color,
+    primary: Color,
+    accent: Color,
+    success: Color,
+    warning: Color,
+    error: Color,
+    river: Color,
+    road: Color,
+    road_minor: Color,
+    stop: Color,
+}
+
+static THEME: LazyLock<Theme> = LazyLock::new(|| {
+    let truecolor =
+        std::env::var("COLORTERM").is_ok_and(|v| v.contains("truecolor") || v.contains("24bit"));
+    let c = |hex| colour(hex, truecolor);
+    Theme {
+        truecolor,
+        bg: c(0x0c111d),
+        surface: c(0x141b2c),
+        panel: c(0x1e2941),
+        field: c(0x1a2b4b),
+        fg: c(0xe4e9f2),
+        muted: c(0x8d97ab),
+        primary: c(0x3f9de3), // the site's button blue, a touch softer
+        accent: c(0x9dcff5),
+        success: c(0x8fc48a),
+        warning: c(0xe0b25c),
+        error: c(0xe0675c),
+        river: c(0x2f6ea8),
+        road: c(0x3b4459),
+        road_minor: c(0x252d3f),
+        stop: c(0x65708a),
+    }
+});
+
+/// 24-bit colour where the terminal says it has it, else the nearest of the 256.
+fn colour(hex: u32, truecolor: bool) -> Color {
+    let [_, r, g, b] = hex.to_be_bytes();
+    if truecolor {
+        return Color::Rgb(r, g, b);
+    }
+    // The 256 palette has a 6x6x6 cube and a 24-step grey ramp: take whichever lands closer.
+    const STEPS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+    let step = |v: u8| (0..6).min_by_key(|&i| v.abs_diff(STEPS[i])).unwrap();
+    let (cr, cg, cb) = (step(r), step(g), step(b));
+    let grey = ((u16::from(r) + u16::from(g) + u16::from(b)) / 3).saturating_sub(3) / 10;
+    let grey = grey.min(23) as u8;
+    let off = |to: [u8; 3]| -> u32 {
+        [r, g, b]
+            .iter()
+            .zip(to)
+            .map(|(v, t)| u32::from(v.abs_diff(t)).pow(2))
+            .sum()
+    };
+    if off([8 + 10 * grey; 3]) < off([STEPS[cr], STEPS[cg], STEPS[cb]]) {
+        Color::Indexed(232 + grey)
+    } else {
+        Color::Indexed((16 + 36 * cr + 6 * cg + cb) as u8)
+    }
+}
+
+type Point = (f64, f64); // (lon, lat)
+
+const LANDMARKS: [(&str, f64, f64); 4] = [
+    ("Plaza Mayor", -5.6640, 40.9650),
+    ("Estación de tren", -5.6487, 40.9722),
+    ("Hospital", -5.6754, 40.9621),
+    ("Río Tormes", -5.6610, 40.9515),
+];
+
+#[derive(Clone, Copy, PartialEq)]
+enum Tab {
+    Stops,
+    Arrivals,
+    Map,
+}
+
+/// What a click on a region of the screen does.
+#[derive(Clone, PartialEq)]
+enum Hit {
+    Tab(Tab),
+    Key(KeyCode),
+    Result(usize),
+    Favourite(usize),
+    Line(Option<String>),
+}
+
+/// What the UI wants fetched, and what the worker has fetched.
+struct Shared {
+    tab: Tab,
+    favourites: Vec<String>,
+    refresh: bool,
+    positions: Vec<Vehicle>,
+    positions_at: Option<Instant>,
+    /// Where each vehicle has been since the map was opened, oldest first.
+    trails: HashMap<String, Vec<Point>>,
+    arrivals: HashMap<String, (Instant, Vec<Arrival>)>,
+    error: Option<String>,
+}
+
+/// River and roads from OpenStreetMap, drawn under the stops.
+#[derive(Deserialize)]
+struct Basemap {
+    river: Vec<Vec<Point>>,
+    main: Vec<Vec<Point>>,
+    minor: Vec<Vec<Point>>,
+}
+
+/// What `draw_city` puts on a map, bottom layer first.
+#[derive(Default)]
+struct City<'a> {
+    /// The map is fitted to these.
+    focus: &'a [Point],
+    dots: &'a [Point],
+    bright: &'a [Point],
+    bright_colour: Color,
+    trails: Vec<(&'a [Point], Color)>,
+    labels: Vec<(Point, Span<'static>)>,
+}
+
+struct App {
+    stops: Vec<Stop>,
+    basemap: Basemap,
+    shared: Arc<Mutex<Shared>>,
+    query: String,
+    results: ListState,
+    selected: usize,
+    line: Option<String>,
+    /// Clickable regions of the last frame.
+    hits: Vec<(Rect, Hit)>,
+    mouse: Option<Position>,
+    /// When the bus on the Paradas tab was first shown: its animation runs from here.
+    bus_since: Option<Instant>,
+}
+
+pub fn run(client: Client) -> io::Result<()> {
+    let favourites = load_favourites();
+    let shared = Arc::new(Mutex::new(Shared {
+        tab: if favourites.is_empty() {
+            Tab::Stops
+        } else {
+            Tab::Arrivals
+        },
+        favourites,
+        refresh: false,
+        positions: vec![],
+        positions_at: None,
+        trails: HashMap::new(),
+        arrivals: HashMap::new(),
+        error: None,
+    }));
+    // Not joined: the process ends when the UI does.
+    thread::spawn({
+        let shared = shared.clone();
+        move || worker(&client, &shared)
+    });
+    let mut app = App {
+        stops: api::bundled_stops(),
+        basemap: serde_json::from_str(include_str!("../data/basemap.json"))
+            .expect("bundled basemap.json"),
+        shared,
+        query: String::new(),
+        results: ListState::default().with_selected(Some(0)),
+        selected: 0,
+        line: None,
+        hits: vec![],
+        mouse: None,
+        bus_since: None,
+    };
+    let mut terminal = ratatui::init();
+    // ratatui's panic hook restores the screen but leaves mouse reporting on.
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(io::stdout(), DisableMouseCapture);
+        hook(info);
+    }));
+    let result =
+        execute!(io::stdout(), EnableMouseCapture).and_then(|()| app.event_loop(&mut terminal));
+    let _ = execute!(io::stdout(), DisableMouseCapture);
+    ratatui::restore();
+    result
+}
+
+/// Only fetches what the open tab shows, one request at a time.
+fn worker(client: &Client, shared: &Mutex<Shared>) {
+    const POSITIONS: &str = "";
+    let mut fetched: HashMap<String, Instant> = HashMap::new();
+    loop {
+        let (tab, favourites) = {
+            let mut s = shared.lock().unwrap();
+            if std::mem::take(&mut s.refresh) {
+                fetched.clear();
+            }
+            (s.tab, s.favourites.clone())
+        };
+        fetched.retain(|key, _| key == POSITIONS || favourites.contains(key));
+        let due =
+            |key: &str, every: Duration| fetched.get(key).is_none_or(|at| at.elapsed() >= every);
+        let job = match tab {
+            Tab::Map => due(POSITIONS, POSITIONS_EVERY).then(|| POSITIONS.to_owned()),
+            Tab::Arrivals => favourites.into_iter().find(|id| due(id, ARRIVALS_EVERY)),
+            Tab::Stops => None,
+        };
+        let Some(key) = job else {
+            thread::sleep(Duration::from_millis(100));
+            continue;
+        };
+        let error = if key == POSITIONS {
+            client.positions().map(|vehicles| {
+                let mut s = shared.lock().unwrap();
+                s.trails
+                    .retain(|id, _| vehicles.iter().any(|v| v.vehicle == *id));
+                for v in &vehicles {
+                    let trail = s.trails.entry(v.vehicle.clone()).or_default();
+                    if trail.last() != Some(&(v.lon, v.lat)) {
+                        trail.push((v.lon, v.lat));
+                    }
+                    let extra = trail.len().saturating_sub(TRAIL_POINTS);
+                    trail.drain(..extra);
+                }
+                s.positions = vehicles;
+                s.positions_at = Some(Instant::now());
+            })
+        } else {
+            client.arrivals(&key).map(|arrivals| {
+                shared
+                    .lock()
+                    .unwrap()
+                    .arrivals
+                    .insert(key.clone(), (Instant::now(), arrivals));
+            })
+        }
+        .err()
+        .map(|e| e.to_string());
+        fetched.insert(key, Instant::now());
+        shared.lock().unwrap().error = error;
+    }
+}
+
+impl App {
+    fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
+        loop {
+            terminal.draw(|frame| self.draw(frame))?;
+            // Smooth only while the bus is on its way in.
+            let moving = self.bus_since.is_some_and(|t| t.elapsed() < DOORS_OPEN);
+            if !event::poll(Duration::from_millis(if moving { 33 } else { 200 }))? {
+                continue;
+            }
+            let quit = match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => self.on_key(key),
+                Event::Mouse(mouse) => self.on_mouse(mouse),
+                _ => false,
+            };
+            if quit {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Returns true to quit.
+    fn on_mouse(&mut self, mouse: MouseEvent) -> bool {
+        let at = Position::new(mouse.column, mouse.row);
+        self.mouse = Some(at);
+        match mouse.kind {
+            MouseEventKind::ScrollDown => self.on_key(KeyCode::Down.into()),
+            MouseEventKind::ScrollUp => self.on_key(KeyCode::Up.into()),
+            MouseEventKind::Down(MouseButton::Left) => {
+                let hit = self
+                    .hits
+                    .iter()
+                    .rev()
+                    .find(|(rect, _)| rect.contains(at))
+                    .map(|(_, hit)| hit.clone());
+                match hit {
+                    Some(Hit::Key(code)) => return self.on_key(code.into()),
+                    Some(Hit::Tab(tab)) => self.shared.lock().unwrap().tab = tab,
+                    // A second click on the chosen stop saves it, like Enter.
+                    Some(Hit::Result(i)) if self.results.selected() == Some(i) => {
+                        return self.on_key(KeyCode::Enter.into());
+                    }
+                    Some(Hit::Result(i)) => self.results.select(Some(i)),
+                    Some(Hit::Favourite(i)) => self.selected = i,
+                    Some(Hit::Line(line)) => self.line = line,
+                    None => {}
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// Returns true to quit.
+    fn on_key(&mut self, key: KeyEvent) -> bool {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            return true;
+        }
+        let shared = self.shared.clone();
+        let mut s = shared.lock().unwrap();
+        match (s.tab, key.code) {
+            (Tab::Stops, KeyCode::Tab) | (Tab::Map, KeyCode::BackTab) => s.tab = Tab::Arrivals,
+            (Tab::Arrivals, KeyCode::Tab) | (Tab::Stops, KeyCode::BackTab) => s.tab = Tab::Map,
+            (Tab::Map, KeyCode::Tab) | (Tab::Arrivals, KeyCode::BackTab) => s.tab = Tab::Stops,
+
+            (Tab::Stops, KeyCode::Char(c)) => {
+                self.query.push(c);
+                self.results.select(Some(0));
+            }
+            (Tab::Stops, KeyCode::Backspace) => {
+                self.query.pop();
+                self.results.select(Some(0));
+            }
+            (Tab::Stops, KeyCode::Esc) if !self.query.is_empty() => self.query.clear(),
+            (Tab::Stops, KeyCode::Down) => self.results.select_next(),
+            (Tab::Stops, KeyCode::Up) => self.results.select_previous(),
+            (Tab::Stops, KeyCode::Enter) => {
+                let found = api::search(&self.stops, &self.query);
+                if let Some(stop) = self.results.selected().and_then(|i| found.get(i)) {
+                    if !s.favourites.contains(&stop.id) {
+                        s.favourites.push(stop.id.clone());
+                        save_favourites(&s.favourites);
+                    }
+                    self.selected = s
+                        .favourites
+                        .iter()
+                        .position(|id| *id == stop.id)
+                        .unwrap_or(0);
+                    s.tab = Tab::Arrivals;
+                }
+            }
+
+            (_, KeyCode::Char('q') | KeyCode::Esc) => return true,
+            (_, KeyCode::Char('r')) => s.refresh = true,
+
+            (Tab::Arrivals, KeyCode::Down | KeyCode::Char('j')) => {
+                self.selected = (self.selected + 1).min(s.favourites.len().saturating_sub(1));
+            }
+            (Tab::Arrivals, KeyCode::Up | KeyCode::Char('k')) => {
+                self.selected = self.selected.saturating_sub(1)
+            }
+            (Tab::Arrivals, KeyCode::Char('d') | KeyCode::Delete)
+                if self.selected < s.favourites.len() =>
+            {
+                let id = s.favourites.remove(self.selected);
+                s.arrivals.remove(&id);
+                save_favourites(&s.favourites);
+                self.selected = self.selected.min(s.favourites.len().saturating_sub(1));
+            }
+
+            (Tab::Map, KeyCode::Down | KeyCode::Right | KeyCode::Up | KeyCode::Left) => {
+                // Cycle: all → each line with a bus on the road → all.
+                let mut options: Vec<Option<String>> = vec![None];
+                options.extend(
+                    lines_on_road(&s.positions)
+                        .into_iter()
+                        .map(|(line, _, _)| Some(line)),
+                );
+                let at = options.iter().position(|o| *o == self.line).unwrap_or(0);
+                let forward = matches!(key.code, KeyCode::Down | KeyCode::Right);
+                let step = if forward { 1 } else { options.len() - 1 };
+                self.line = options[(at + step) % options.len()].clone();
+            }
+            _ => {}
+        }
+        false
+    }
+
+    /// A row of clickable groups of spans, laid out left to right. The one under the mouse lights up.
+    fn buttons(
+        &mut self,
+        area: Rect,
+        items: Vec<(Vec<Span<'static>>, Option<Hit>)>,
+    ) -> Line<'static> {
+        let mut x = area.x;
+        let mut line = vec![];
+        for (spans, hit) in items {
+            let width = spans.iter().map(Span::width).sum::<usize>() as u16;
+            let rect = Rect {
+                x,
+                width,
+                height: 1,
+                ..area
+            };
+            x += width;
+            let hot = hit.is_some() && self.mouse.is_some_and(|at| rect.contains(at));
+            line.extend(
+                spans
+                    .into_iter()
+                    .map(|span| if hot { span.bg(THEME.panel) } else { span }),
+            );
+            self.hits.extend(hit.map(|hit| (rect, hit)));
+        }
+        Line::from(line)
+    }
+
+    fn draw(&mut self, frame: &mut Frame) {
+        let t = &*THEME;
+        self.hits.clear();
+        frame.render_widget(
+            Block::new().style(Style::new().bg(t.bg).fg(t.fg)),
+            frame.area(),
+        );
+        let [header, _, body, _, footer] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .areas(frame.area());
+        let padded = Margin::new(2, 0);
+        let shared = self.shared.clone();
+        let s = shared.lock().unwrap();
+
+        let mut top = vec![(vec!["salbus".fg(t.primary).bold(), "   ".into()], None)];
+        for (tab, name) in [
+            (Tab::Stops, "Paradas"),
+            (Tab::Arrivals, "Llegadas"),
+            (Tab::Map, "Mapa"),
+        ] {
+            let label = format!(" {name} ");
+            let label = if tab == s.tab {
+                label.fg(t.bg).bg(t.primary).bold()
+            } else {
+                label.fg(t.muted)
+            };
+            // The chosen tab keeps its colour under the mouse.
+            top.push((vec![label], (tab != s.tab).then_some(Hit::Tab(tab))));
+            top.push((vec![" ".into()], None));
+        }
+        let top = self.buttons(header.inner(padded), top);
+        frame.render_widget(top, header.inner(padded));
+        let freshest = match s.tab {
+            Tab::Stops => None,
+            Tab::Arrivals => s.arrivals.values().map(|(at, _)| *at).max(),
+            Tab::Map => s.positions_at,
+        };
+        let live = match freshest {
+            _ if s.tab == Tab::Stops => format!("{} paradas", self.stops.len()).fg(t.muted),
+            Some(at) if at.elapsed() < Duration::from_secs(90) => "● en vivo".fg(t.success),
+            Some(_) => "● datos viejos".fg(t.warning),
+            None => "○ cargando…".fg(t.muted),
+        };
+        frame.render_widget(Line::from(live).right_aligned(), header.inner(padded));
+
+        let hints: &[(&str, &str, KeyCode)] = match s.tab {
+            Tab::Stops => &[
+                ("↑↓", "elegir", KeyCode::Down),
+                ("enter", "guardar parada", KeyCode::Enter),
+                ("tab", "llegadas", KeyCode::Tab),
+                ("esc", "salir", KeyCode::Esc),
+            ],
+            Tab::Arrivals => &[
+                ("↑↓", "parada", KeyCode::Down),
+                ("d", "quitar", KeyCode::Char('d')),
+                ("r", "actualizar", KeyCode::Char('r')),
+                ("tab", "mapa", KeyCode::Tab),
+                ("q", "salir", KeyCode::Char('q')),
+            ],
+            Tab::Map => &[
+                ("↑↓", "línea", KeyCode::Down),
+                ("r", "actualizar", KeyCode::Char('r')),
+                ("tab", "paradas", KeyCode::Tab),
+                ("q", "salir", KeyCode::Char('q')),
+            ],
+        };
+        let mut bar: Vec<(Vec<Span>, Option<Hit>)> = hints
+            .iter()
+            .map(|(key, what, code)| {
+                let spans = vec![
+                    format!(" {key} ").fg(t.accent).bold(),
+                    format!("{what}  ").fg(t.fg),
+                ];
+                (spans, Some(Hit::Key(*code)))
+            })
+            .collect();
+        if let Some(error) = &s.error {
+            bar.push((vec![format!(" {error}").fg(t.error)], None));
+        }
+        frame.render_widget(Block::new().style(Style::new().bg(t.surface)), footer);
+        let bar = self.buttons(footer.inner(Margin::new(1, 0)), bar);
+        frame.render_widget(bar, footer.inner(Margin::new(1, 0)));
+
+        let body = body.inner(padded);
+        match s.tab {
+            Tab::Stops => self.draw_stops(frame, body, &s),
+            Tab::Arrivals => self.draw_arrivals(frame, body, &s),
+            Tab::Map => self.draw_map(frame, body, &s),
+        }
+    }
+
+    fn draw_stops(&mut self, frame: &mut Frame, area: Rect, s: &Shared) {
+        let t = &*THEME;
+        let (left, side) = with_side_panel(area);
+        // The wordmark and the bus give way to results as soon as there is something to look for.
+        let hero = if self.query.is_empty() && left.height >= 30 {
+            15
+        } else {
+            0
+        };
+        let [hero, input, _, count, _, list] = Layout::vertical([
+            Constraint::Length(hero),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .areas(left);
+        if hero.height > 0 {
+            let mut art: Vec<Line> = WORDMARK
+                .iter()
+                .map(|row| Line::from(row.fg(t.primary).bold()))
+                .collect();
+            art.push(Line::default());
+            art.push(Line::from(
+                "Autobuses urbanos de Salamanca, en vivo".fg(t.muted),
+            ));
+            frame.render_widget(Paragraph::new(art).centered(), hero);
+            let street = Rect {
+                y: hero.y + 6,
+                height: 8,
+                ..hero
+            };
+            self.draw_bus(frame, street);
+        }
+
+        let width = usize::from(left.width).saturating_sub(10).min(56);
+        let typed = if self.query.is_empty() {
+            format!(" {:<width$}", "nombre, calle o número").fg(t.muted)
+        } else {
+            format!(" {:<width$}", format!("{}▏", self.query)).fg(t.fg)
+        };
+        frame.render_widget(
+            Line::from(vec!["Parada   ".fg(t.muted), typed.bg(t.field)]),
+            input,
+        );
+
+        let found = api::search(&self.stops, &self.query);
+        let help = format!(
+            "{} paradas. Elige una con las flechas o el ratón.",
+            found.len()
+        );
+        frame.render_widget(Line::from(help.fg(t.muted)), count);
+
+        // Badges need 4 columns per line; the busiest stops have 8 or more.
+        let name_width = usize::from(left.width).saturating_sub(48).clamp(16, 30);
+        let first = self.results.offset();
+        let chosen = self.results.selected();
+        let items = found.iter().enumerate().map(|(i, stop)| {
+            let row = Rect {
+                y: list.y + i.saturating_sub(first) as u16,
+                height: 1,
+                ..list
+            };
+            let hot = i >= first
+                && self
+                    .mouse
+                    .is_some_and(|at| row.contains(at) && list.contains(at));
+            // The cursor stops short of the line numbers so they keep their colours.
+            let base = match (chosen == Some(i), hot) {
+                (true, _) => Style::new().fg(t.bg).bg(t.primary).bold(),
+                (false, true) => Style::new().bg(t.panel),
+                (false, false) => Style::new(),
+            };
+            let star = if s.favourites.contains(&stop.id) {
+                "★"
+            } else {
+                " "
+            };
+            let number = Span::styled(format!(" {star} {:>3}  ", stop.id), base);
+            let mut cells = vec![
+                if chosen == Some(i) {
+                    number
+                } else {
+                    number.fg(t.accent)
+                },
+                Span::styled(
+                    format!("{:<name_width$} ", clip(&stop.name, name_width)),
+                    base,
+                ),
+                " ".into(),
+            ];
+            // Busy stops serve up to 13 lines: show what fits and count the rest.
+            let mut room = usize::from(left.width).saturating_sub(name_width + 14);
+            for (n, line) in stop.lines.iter().enumerate() {
+                // Coloured text, not filled badges: a wall of 300 filled badges glares.
+                let badge = Span::styled(
+                    format!(" {line:>2} "),
+                    Style::new().fg(line_colour(line)).bold(),
+                );
+                if badge.width() > room {
+                    cells.push(format!(" +{}", stop.lines.len() - n).fg(t.muted));
+                    break;
+                }
+                room -= badge.width();
+                cells.push(badge);
+            }
+            Line::from(cells)
+        });
+        let rows = found.len();
+        frame.render_stateful_widget(
+            List::new(items).style(Style::new().bg(t.surface)),
+            list,
+            &mut self.results,
+        );
+        let first = self.results.offset();
+        for row in 0..usize::from(list.height).min(rows.saturating_sub(first)) {
+            let rect = Rect {
+                y: list.y + row as u16,
+                height: 1,
+                ..list
+            };
+            self.hits.push((rect, Hit::Result(first + row)));
+        }
+
+        let Some(side) = side else { return };
+        let stop = self.results.selected().and_then(|i| found.get(i));
+        let everything: Vec<Point> = self.stops.iter().filter_map(point).collect();
+        let title = stop.map_or("Mapa".to_owned(), |stop| {
+            format!("{} · {}", stop.id, stop.name)
+        });
+        let labels = stop
+            .and_then(|stop| point(stop))
+            .map(|p| (p, "◉".fg(t.accent).bold()))
+            .into_iter()
+            .collect();
+        let city = City {
+            focus: &everything,
+            dots: &everything,
+            labels,
+            ..City::default()
+        };
+        self.draw_city(frame, side, panel(&title, false), city);
+    }
+
+    /// The bus pulls in from the left, stops at the sign and opens its doors, once per run.
+    fn draw_bus(&mut self, frame: &mut Frame, area: Rect) {
+        let since = self.bus_since.get_or_insert_with(Instant::now).elapsed();
+        let parked = ((i32::from(area.width) - SCENE_WIDTH) / 2).max(0);
+        let left = 1.0 - (since.as_secs_f64() / DRIVE.as_secs_f64()).min(1.0);
+        // Out of sight at first, braking as it nears the sign.
+        let x = parked - (f64::from(parked + BUS_WIDTH) * left.powi(3)).round() as i32;
+        let (spoke, open) = (x.rem_euclid(4) as usize, since >= DOORS_OPEN);
+        let paint = |pixel, col, row| sprite_colour(pixel, col, row, spoke, open);
+        draw_sprite(frame, area, parked + BUS_WIDTH + 2, &STOP_SIGN, paint);
+        draw_sprite(frame, area, x, &BUS, paint);
+        let road = Rect {
+            y: area.y + 7,
+            height: 1,
+            ..area
+        };
+        frame.render_widget(
+            Line::from("▀".repeat(area.width.into()).fg(THEME.road)),
+            road,
+        );
+    }
+
+    fn draw_arrivals(&mut self, frame: &mut Frame, area: Rect, s: &Shared) {
+        let t = &*THEME;
+        if s.favourites.is_empty() {
+            let (tab, enter) = ("tab".fg(t.accent).bold(), "enter".fg(t.accent).bold());
+            let how = vec![
+                "Pulsa ".into(),
+                tab,
+                " hasta «Paradas», busca una y pulsa ".into(),
+                enter,
+                ".".into(),
+            ];
+            let help = vec![
+                Line::default(),
+                Line::from("Aún no has guardado ninguna parada.")
+                    .bold()
+                    .centered(),
+                Line::default(),
+                Line::from(how).fg(t.muted).centered(),
+            ];
+            return frame.render_widget(Paragraph::new(help), area);
+        }
+        let (cards, side) = with_side_panel(area);
+        let now = api::now_epoch();
+        // A title row, the arrivals, and a blank row before the next card.
+        let height = |id: &String| {
+            let rows = s
+                .arrivals
+                .get(id)
+                .map_or(1, |(_, list)| list.len().clamp(1, ARRIVALS_SHOWN));
+            rows as u16 + 2
+        };
+
+        // Start at the first card that still leaves the selected one fully visible.
+        let mut first = 0;
+        while first < self.selected
+            && s.favourites[first..=self.selected]
+                .iter()
+                .map(height)
+                .sum::<u16>()
+                > cards.height + 1
+        {
+            first += 1;
+        }
+        let mut y = cards.y;
+        for (i, id) in s.favourites.iter().enumerate().skip(first) {
+            let rect = Rect {
+                y,
+                height: (height(id) - 1).min(cards.bottom().saturating_sub(y)),
+                ..cards
+            };
+            if rect.height < 2 {
+                break;
+            }
+            y += rect.height + 1;
+            let name = self
+                .stops
+                .iter()
+                .find(|stop| stop.id == *id)
+                .map_or("", |stop| stop.name.as_str());
+            let fetched = s.arrivals.get(id);
+            let age = fetched.map_or("cargando…".to_owned(), |(at, _)| {
+                format!("hace {} s", at.elapsed().as_secs())
+            });
+            let block = panel(&format!("★ {id} · {name}"), i == self.selected)
+                .title_top(Line::from(format!("{age} ")).fg(t.muted).right_aligned());
+            let width = usize::from(rect.width);
+            let rows: Vec<Line> = match fetched {
+                None => vec![],
+                Some((_, list)) if list.is_empty() => {
+                    vec![" sin autobuses previstos".fg(t.muted).into()]
+                }
+                Some((_, list)) => list
+                    .iter()
+                    .take(ARRIVALS_SHOWN)
+                    .map(|a| arrival_row(a, now, width))
+                    .collect(),
+            };
+            frame.render_widget(Paragraph::new(rows).block(block), rect);
+            self.hits.push((rect, Hit::Favourite(i)));
+        }
+
+        let Some(side) = side else { return };
+        let Some(id) = s.favourites.get(self.selected) else {
+            return;
+        };
+        let here = self
+            .stops
+            .iter()
+            .find(|stop| stop.id == *id)
+            .and_then(point);
+        // The arrivals already say where each bus is: no extra request for this map.
+        let coming: Vec<(Point, &Arrival)> = s
+            .arrivals
+            .get(id)
+            .map(|(_, list)| {
+                list.iter()
+                    .take(ARRIVALS_SHOWN)
+                    .filter_map(|a| Some(((a.lon?, a.lat?), a)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let focus: Vec<Point> = here
+            .into_iter()
+            .chain(coming.iter().map(|(p, _)| *p))
+            .collect();
+        let everything: Vec<Point> = self.stops.iter().filter_map(point).collect();
+        // Furthest first, so the next bus is drawn on top.
+        let mut labels: Vec<(Point, Span)> = coming
+            .iter()
+            .rev()
+            .map(|(p, a)| (*p, badge(&a.line)))
+            .collect();
+        labels.extend(here.map(|p| (p, "◉".fg(t.accent).bold())));
+        let city = City {
+            focus: &focus,
+            dots: &everything,
+            labels,
+            ..City::default()
+        };
+        self.draw_city(frame, side, panel("Autobuses en camino", false), city);
+    }
+
+    fn draw_map(&mut self, frame: &mut Frame, area: Rect, s: &Shared) {
+        let t = &*THEME;
+        let on_line = |line: &str| self.line.as_deref().is_none_or(|l| l == line);
+        let vehicles: Vec<&Vehicle> = s.positions.iter().filter(|v| on_line(&v.line)).collect();
+        let everything: Vec<Point> = self.stops.iter().filter_map(point).collect();
+        let of_line: Vec<Point> = match &self.line {
+            Some(line) => self
+                .stops
+                .iter()
+                .filter(|stop| stop.lines.contains(line))
+                .filter_map(point)
+                .collect(),
+            None => vec![],
+        };
+        // Trails of every bus at once are noise: only for the line being followed.
+        let core = core(&everything);
+        let trails = vehicles
+            .iter()
+            .filter(|_| self.line.is_some())
+            .filter_map(|v| Some((s.trails.get(&v.vehicle)?.as_slice(), line_colour(&v.line))))
+            .collect();
+        let mut labels: Vec<(Point, Span)> = self
+            .stops
+            .iter()
+            .filter(|stop| s.favourites.contains(&stop.id))
+            .filter_map(|stop| Some((point(stop)?, "★".fg(t.accent))))
+            .collect();
+        labels.extend(vehicles.iter().map(|v| {
+            // Each bus is its line number. Following one line there is room for its heading too.
+            let label = match self.line {
+                Some(_) => {
+                    Span::styled(format!(" {} {}", v.line, heading(v)), badge(&v.line).style)
+                }
+                None => Span::styled(v.line.clone(), badge(&v.line).style),
+            };
+            ((v.lon, v.lat), label)
+        }));
+
+        let (map, side) = if area.width >= LEGEND_FROM {
+            let [map, _, side] = Layout::horizontal([
+                Constraint::Min(0),
+                Constraint::Length(2),
+                Constraint::Length(36),
+            ])
+            .areas(area);
+            (map, Some(side))
+        } else {
+            (area, None)
+        };
+        let age = s.positions_at.map_or("cargando…".to_owned(), |at| {
+            format!("hace {} s", at.elapsed().as_secs())
+        });
+        let title = match &self.line {
+            Some(line) => format!("Línea {line} · {} autobuses", vehicles.len()),
+            None => format!("Salamanca · {} autobuses", vehicles.len()),
+        };
+        let key = match self.line {
+            Some(_) => " → en marcha   ● parado   ★ parada guardada",
+            None => " número = línea del autobús   ★ parada guardada",
+        };
+        let block = panel(&title, false)
+            .title_top(Line::from(format!("{age} ")).fg(t.muted).right_aligned())
+            .title_bottom(Line::from(key).fg(t.muted))
+            .title_bottom(Line::from("© OpenStreetMap ").fg(t.muted).right_aligned());
+        let city = City {
+            focus: if of_line.is_empty() { &core } else { &of_line },
+            dots: &everything,
+            bright: &of_line,
+            bright_colour: line_colour(self.line.as_deref().unwrap_or("")),
+            trails,
+            labels,
+        };
+        self.draw_city(frame, map, block, city);
+
+        let Some(side) = side else { return };
+        let block = panel("Líneas en servicio", false);
+        let inner = block.inner(side);
+        let on_road = lines_on_road(&s.positions);
+        let mut entries = vec![(
+            None,
+            "    ".into(),
+            "Todas las líneas".to_owned(),
+            s.positions.len(),
+        )];
+        entries.extend(on_road.into_iter().map(|(line, name, buses)| {
+            let mark = badge(&line);
+            (Some(line), mark, name, buses)
+        }));
+        // Keep the selected line on screen when the list is taller than the panel.
+        let at = entries
+            .iter()
+            .position(|(line, ..)| *line == self.line)
+            .unwrap_or(0);
+        let scroll = (at + 1).saturating_sub(usize::from(inner.height));
+        let mut rows = vec![];
+        for (i, (line, mark, name, buses)) in entries.into_iter().enumerate().skip(scroll) {
+            let rect = Rect {
+                y: inner.y + (i - scroll) as u16,
+                height: 1,
+                ..inner
+            };
+            if rect.y >= inner.bottom() {
+                break;
+            }
+            let base = match (
+                line == self.line,
+                self.mouse.is_some_and(|at| rect.contains(at)),
+            ) {
+                (true, _) => Style::new().fg(t.bg).bg(t.primary).bold(),
+                (false, true) => Style::new().bg(t.panel),
+                (false, false) => Style::new().fg(t.muted),
+            };
+            let name = Span::styled(format!(" {:<23}{buses:>3} ", clip(&name, 22)), base);
+            rows.push(Line::from(vec![" ".into(), mark, name]));
+            self.hits.push((rect, Hit::Line(line)));
+        }
+        frame.render_widget(Paragraph::new(rows).block(block), side);
+    }
+
+    /// City map: roads and river, stop dots, highlighted stops, trails, then labels on top.
+    fn draw_city(&self, frame: &mut Frame, area: Rect, block: Block, city: City) {
+        let t = &*THEME;
+        let inner = block.inner(area);
+        let (x_bounds, y_bounds) = fit(city.focus, inner);
+        // Labels are drawn from their left edge; nudge them so they sit on the point.
+        let cell = (x_bounds[1] - x_bounds[0]) / f64::from(inner.width.max(1));
+        let canvas = Canvas::default()
+            .block(block)
+            .background_color(t.surface)
+            .marker(Marker::Braille)
+            .x_bounds(x_bounds)
+            .y_bounds(y_bounds)
+            .paint(|ctx| {
+                for (lines, colour) in [
+                    (&self.basemap.minor, t.road_minor),
+                    (&self.basemap.main, t.road),
+                    (&self.basemap.river, t.river),
+                ] {
+                    for pair in lines.iter().flat_map(|line| line.windows(2)) {
+                        ctx.draw(&Segment::new(
+                            pair[0].0, pair[0].1, pair[1].0, pair[1].1, colour,
+                        ));
+                    }
+                }
+                ctx.layer();
+                ctx.draw(&Points {
+                    coords: city.dots,
+                    color: t.stop,
+                });
+                ctx.layer();
+                for (trail, colour) in &city.trails {
+                    ctx.draw(&Points {
+                        coords: trail,
+                        color: *colour,
+                    });
+                }
+                ctx.draw(&Points {
+                    coords: city.bright,
+                    color: city.bright_colour,
+                });
+                // Zoomed out to the whole network the names would sit on top of each other.
+                let places = if cell < 0.0015 { &LANDMARKS[..] } else { &[] };
+                for &(name, lon, lat) in places {
+                    let shift = cell * (name.chars().count() as f64) / 2.0;
+                    ctx.print(lon - shift, lat, name.fg(t.stop).italic());
+                }
+                for ((lon, lat), label) in &city.labels {
+                    let shift = cell * (label.width().saturating_sub(1) as f64) / 2.0;
+                    ctx.print(lon - shift, *lat, label.clone());
+                }
+            });
+        frame.render_widget(canvas, area);
+    }
+}
+
+/// `sprite` drawn `x` cells from `area`'s left edge, clipped to it; `None` pixels are see-through.
+fn draw_sprite(
+    frame: &mut Frame,
+    area: Rect,
+    x: i32,
+    sprite: &[&str],
+    colour: impl Fn(u8, usize, usize) -> Option<Color>,
+) {
+    for (row, pair) in sprite.chunks(2).enumerate() {
+        let (top, bottom) = (pair[0].as_bytes(), pair[1].as_bytes());
+        for col in 0..top.len() {
+            let on_screen = i32::from(area.x) + x + col as i32;
+            let (Ok(sx), sy) = (u16::try_from(on_screen), area.y + row as u16) else {
+                continue;
+            };
+            if !area.contains(Position::new(sx, sy)) {
+                continue;
+            }
+            let cell = &mut frame.buffer_mut()[(sx, sy)];
+            match (
+                colour(top[col], col, 2 * row),
+                colour(bottom[col], col, 2 * row + 1),
+            ) {
+                (Some(top), Some(bottom)) => cell.set_char('▀').set_fg(top).set_bg(bottom),
+                (Some(top), None) => cell.set_char('▀').set_fg(top),
+                (None, Some(bottom)) => cell.set_char('▄').set_fg(bottom),
+                (None, None) => cell,
+            };
+        }
+    }
+}
+
+/// `spoke` is which of a hub's four pixels is lit, so the wheels turn; `open` is the doors.
+fn sprite_colour(pixel: u8, x: usize, y: usize, spoke: usize, open: bool) -> Option<Color> {
+    let t = &*THEME;
+    Some(match pixel {
+        b'B' => t.primary,
+        b'D' => t.river,
+        b'W' => t.accent,
+        b'd' if open => t.panel,
+        b'd' => t.accent,
+        b'i' if open => t.panel,
+        b'i' => t.primary,
+        b'L' => t.fg,
+        b'S' => t.panel,
+        b'A' => t.warning,
+        b'T' => t.error,
+        b'K' => t.muted,
+        b'P' => t.muted,
+        b'H' => {
+            // The hub's pixels clockwise from the top left; the wheels are 19 apart.
+            let (dx, dy) = ((x + 11) % 19, y - 11);
+            let clockwise = if dy == 0 { dx } else { 3 - dx };
+            if clockwise == spoke { t.fg } else { t.stop }
+        }
+        _ => return None,
+    })
+}
+
+fn arrival_row(a: &Arrival, now: i64, width: usize) -> Line<'static> {
+    const BAR: usize = 14;
+    const BAR_MINUTES: usize = 20;
+    let t = &*THEME;
+    let minutes = a.expected_epoch.map(|e| api::minutes_until(e, now));
+    let (eta, eta_colour) = match minutes {
+        Some(0) => ("llegando".to_owned(), t.success),
+        Some(m) if m <= 2 => (format!("{m} min"), t.success),
+        Some(m) if m <= 6 => (format!("{m} min"), t.warning),
+        Some(m) => (format!("{m} min"), t.fg),
+        None => ("?".to_owned(), t.muted),
+    };
+    // Fills up as the bus gets closer; empty at 20 minutes or more.
+    let left = minutes.map_or(BAR_MINUTES, |m| (m as usize).min(BAR_MINUTES));
+    let filled = BAR - left * BAR / BAR_MINUTES;
+    let clock = a
+        .expected
+        .as_deref()
+        .and_then(|e| e.get(11..16))
+        .unwrap_or("");
+    let distance = match a.distance_m {
+        Some(m) if m >= 1000.0 => format!("{:.1} km", m / 1000.0),
+        Some(m) => format!("{m:.0} m"),
+        None => String::new(),
+    };
+    // Everything but the destination has a fixed width; the destination takes the rest.
+    let room = width.saturating_sub(BAR + 34).max(8);
+    Line::from(vec![
+        " ".into(),
+        badge(&a.line),
+        format!(" {:<room$} ", clip(&a.destination, room)).into(),
+        "━".repeat(filled).fg(line_colour(&a.line)),
+        "─".repeat(BAR - filled).fg(t.panel),
+        format!(" {eta:>9}").fg(eta_colour).bold(),
+        format!("  {clock:<5}").fg(t.muted),
+        format!("  {distance:>7} ").fg(t.muted),
+    ])
+}
+
+/// (line, name, buses) for every line with a bus on the road, in line order.
+fn lines_on_road(positions: &[Vehicle]) -> Vec<(String, String, usize)> {
+    let mut lines: Vec<(String, String, usize)> = vec![];
+    for v in positions {
+        match lines.iter_mut().find(|(line, _, _)| *line == v.line) {
+            Some(entry) => entry.2 += 1,
+            None => lines.push((v.line.clone(), v.line_name.clone(), 1)),
+        }
+    }
+    lines.sort_by_key(|(line, _, _)| api::numeric(line));
+    lines
+}
+
+/// Arrow for a moving bus, dot for a stopped one (the API sends bearing 0 when stopped).
+fn heading(v: &Vehicle) -> &'static str {
+    const ARROWS: [&str; 8] = ["↑", "↗", "→", "↘", "↓", "↙", "←", "↖"];
+    match (v.bearing, v.speed) {
+        (Some(bearing), Some(speed)) if speed > 0.0 => {
+            ARROWS[(((bearing + 22.5) / 45.0) as usize) % 8]
+        }
+        _ => "●",
+    }
+}
+
+/// Muted hue per line: the operator's all-blue scheme is too close to tell lines apart.
+fn line_colour(line: &str) -> Color {
+    let hex = match line {
+        "1" => 0xd9665b,
+        "2" => 0xe0935a,
+        "3" => 0xdcc060,
+        "4" => 0xa8c95f,
+        "5" => 0x63b06a,
+        "6" => 0x5bbf9f,
+        "7" => 0x5fc8d2,
+        "8" => 0x62a3db,
+        "9" => 0x6f8be0,
+        "10" | "28" => 0x9a8ae0,
+        "11" => 0xbb7fd4,
+        "12" => 0xd97fb0,
+        "13" | "26" => 0xb98a6a,
+        "14" => 0xa3a36b,
+        "15" => 0xc9c4ba,
+        "91" => 0x7f86b8,
+        "92" => 0x9a80ac,
+        _ => 0x8f8a80,
+    };
+    colour(hex, THEME.truecolor)
+}
+
+fn badge(line: &str) -> Span<'static> {
+    Span::styled(
+        format!(" {line:>2} "),
+        Style::new().bg(line_colour(line)).fg(THEME.bg).bold(),
+    )
+}
+
+/// A flat surface titled on its first row, no borders.
+fn panel(title: &str, active: bool) -> Block<'static> {
+    let t = &*THEME;
+    let (surface, text) = if active {
+        (t.panel, t.primary)
+    } else {
+        (t.surface, t.fg)
+    };
+    Block::new()
+        .style(Style::new().bg(surface))
+        .title(Span::from(format!(" {title} ")).fg(text).bold())
+}
+
+fn with_side_panel(area: Rect) -> (Rect, Option<Rect>) {
+    if area.width < WIDE {
+        return (area, None);
+    }
+    let main = MAIN_WIDTH.max(area.width * 58 / 100);
+    let [left, _, side] = Layout::horizontal([
+        Constraint::Length(main),
+        Constraint::Length(2),
+        Constraint::Min(0),
+    ])
+    .areas(area);
+    (left, Some(side))
+}
+
+fn point(stop: &Stop) -> Option<Point> {
+    Some((stop.lon?, stop.lat?))
+}
+
+fn clip(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_owned();
+    }
+    text.chars()
+        .take(width.saturating_sub(1))
+        .chain(['…'])
+        .collect()
+}
+
+/// `points` minus the outer 5% on each axis: the whole network leaves the centre too cramped.
+fn core(points: &[Point]) -> Vec<Point> {
+    let range = |axis: fn(&Point) -> f64| {
+        let mut values: Vec<f64> = points.iter().map(axis).collect();
+        values.sort_by(f64::total_cmp);
+        let cut = values.len() / 20;
+        values.get(cut).copied().unwrap_or(f64::MIN)
+            ..=values.iter().rev().nth(cut).copied().unwrap_or(f64::MAX)
+    };
+    let (lons, lats) = (range(|p| p.0), range(|p| p.1));
+    points
+        .iter()
+        .copied()
+        .filter(|p| lons.contains(&p.0) && lats.contains(&p.1))
+        .collect()
+}
+
+/// Lon/lat bounds over `points`, widened so the map keeps its shape (braille dots are ~square).
+fn fit(points: &[Point], area: Rect) -> ([f64; 2], [f64; 2]) {
+    const MIN_SPAN: f64 = 0.006; // about 650 m: a single stop still shows its surroundings
+    const CENTRE: Point = (-5.664, 40.965);
+    let (west, east) = points.iter().fold((f64::MAX, f64::MIN), |(lo, hi), p| {
+        (lo.min(p.0), hi.max(p.0))
+    });
+    let (south, north) = points.iter().fold((f64::MAX, f64::MIN), |(lo, hi), p| {
+        (lo.min(p.1), hi.max(p.1))
+    });
+    let (mid_lon, mid_lat) = if points.is_empty() {
+        CENTRE
+    } else {
+        ((west + east) / 2.0, (south + north) / 2.0)
+    };
+    let shrink = mid_lat.to_radians().cos(); // a degree of longitude is shorter than one of latitude
+    let mut width = ((east - west) * shrink).max(MIN_SPAN) * 1.12;
+    let mut height = (north - south).max(MIN_SPAN) * 1.12;
+    let wanted = (f64::from(area.width.max(1)) * 2.0) / (f64::from(area.height.max(1)) * 4.0);
+    if width / height < wanted {
+        width = height * wanted;
+    } else {
+        height = width / wanted;
+    }
+    let half_lon = width / shrink / 2.0;
+    (
+        [mid_lon - half_lon, mid_lon + half_lon],
+        [mid_lat - height / 2.0, mid_lat + height / 2.0],
+    )
+}
+
+fn favourites_path() -> Option<PathBuf> {
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
+    Some(config.join("salbus").join("favourites.json"))
+}
+
+fn load_favourites() -> Vec<String> {
+    let saved: Vec<String> = favourites_path()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default();
+    // Ids end up in a URL: keep only stop numbers.
+    saved
+        .into_iter()
+        .filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+        .collect()
+}
+
+fn save_favourites(favourites: &[String]) {
+    let Some(path) = favourites_path() else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let _ = fs::write(path, serde_json::to_string(favourites).unwrap_or_default());
+}

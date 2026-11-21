@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use std::{fs, io, thread};
@@ -16,9 +17,9 @@ use ratatui::style::{Color, Style, Stylize};
 use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::canvas::{Canvas, Line as Segment, Points};
-use ratatui::widgets::{Block, List, ListState, Paragraph};
+use ratatui::widgets::{Block, Clear, List, ListState, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::api::{self, Arrival, Client, Stop, Vehicle};
 
@@ -56,7 +57,7 @@ const BUS: [&str; 14] = [
     "........KK.................KK...........",
 ];
 const STOP_SIGN: [&str; 14] = [
-    ".....", "LLLLL", "LBBBL", "LBBBL", "LLLLL", "..P..", "..P..", "..P..", "..P..", "..P..",
+    ".....", "FFFFF", "FBBBF", "FBBBF", "FFFFF", "..P..", "..P..", "..P..", "..P..", "..P..",
     "..P..", "..P..", "..P..", "..P..",
 ];
 const BUS_WIDTH: i32 = 40;
@@ -67,7 +68,6 @@ const DOORS_OPEN: Duration = Duration::from_millis(2300);
 
 /// Own background, so it looks the same on any terminal theme; blues from the operator's site.
 struct Theme {
-    truecolor: bool,
     bg: Color,
     surface: Color,
     panel: Color,
@@ -85,29 +85,73 @@ struct Theme {
     stop: Color,
 }
 
-static THEME: LazyLock<Theme> = LazyLock::new(|| {
-    let truecolor =
-        std::env::var("COLORTERM").is_ok_and(|v| v.contains("truecolor") || v.contains("24bit"));
-    let c = |hex| colour(hex, truecolor);
-    Theme {
-        truecolor,
-        bg: c(0x0c111d),
-        surface: c(0x141b2c),
-        panel: c(0x1e2941),
-        field: c(0x1a2b4b),
-        fg: c(0xe4e9f2),
-        muted: c(0x8d97ab),
-        primary: c(0x3f9de3), // the site's button blue, a touch softer
-        accent: c(0x9dcff5),
-        success: c(0x8fc48a),
-        warning: c(0xe0b25c),
-        error: c(0xe0675c),
-        river: c(0x2f6ea8),
-        road: c(0x3b4459),
-        road_minor: c(0x252d3f),
-        stop: c(0x65708a),
-    }
+static TRUECOLOR: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var("COLORTERM").is_ok_and(|v| v.contains("truecolor") || v.contains("24bit"))
 });
+static LIGHT: AtomicBool = AtomicBool::new(false);
+static ENGLISH: AtomicBool = AtomicBool::new(false);
+
+fn tr(es: &'static str, en: &'static str) -> &'static str {
+    if ENGLISH.load(Relaxed) { en } else { es }
+}
+
+fn ago(at: Instant) -> String {
+    let secs = at.elapsed().as_secs();
+    if ENGLISH.load(Relaxed) {
+        format!("{secs} s ago")
+    } else {
+        format!("hace {secs} s")
+    }
+}
+
+static DARK_THEME: LazyLock<Theme> = LazyLock::new(|| Theme {
+    bg: rgb(0x0c111d),
+    surface: rgb(0x141b2c),
+    panel: rgb(0x1e2941),
+    field: rgb(0x1a2b4b),
+    fg: rgb(0xe4e9f2),
+    muted: rgb(0x8d97ab),
+    primary: rgb(0x3f9de3), // the site's button blue, a touch softer
+    accent: rgb(0x9dcff5),
+    success: rgb(0x8fc48a),
+    warning: rgb(0xe0b25c),
+    error: rgb(0xe0675c),
+    river: rgb(0x2f6ea8),
+    road: rgb(0x3b4459),
+    road_minor: rgb(0x252d3f),
+    stop: rgb(0x65708a),
+});
+
+static LIGHT_THEME: LazyLock<Theme> = LazyLock::new(|| Theme {
+    bg: rgb(0xf4f7fb),
+    surface: rgb(0xe9eef6),
+    panel: rgb(0xd6e0ee),
+    // Not lighter: in 256 colours it would land on the same grey as `panel`.
+    field: rgb(0xcfdcef),
+    fg: rgb(0x1b2333),
+    muted: rgb(0x5f6b80),
+    primary: rgb(0x1a73c2),
+    accent: rgb(0x0d4f8f),
+    success: rgb(0x2e6b34),
+    warning: rgb(0x8f5300),
+    error: rgb(0xb3261e),
+    river: rgb(0x5a9bd8),
+    road: rgb(0xb3bccb),
+    road_minor: rgb(0xd3dae5),
+    stop: rgb(0x8a94a8),
+});
+
+fn theme() -> &'static Theme {
+    if LIGHT.load(Relaxed) {
+        &LIGHT_THEME
+    } else {
+        &DARK_THEME
+    }
+}
+
+fn rgb(hex: u32) -> Color {
+    colour(hex, *TRUECOLOR)
+}
 
 /// 24-bit colour where the terminal says it has it, else the nearest of the 256.
 fn colour(hex: u32, truecolor: bool) -> Color {
@@ -137,11 +181,11 @@ fn colour(hex: u32, truecolor: bool) -> Color {
 
 type Point = (f64, f64); // (lon, lat)
 
-const LANDMARKS: [(&str, f64, f64); 4] = [
-    ("Plaza Mayor", -5.6640, 40.9650),
-    ("Estación de tren", -5.6487, 40.9722),
-    ("Hospital", -5.6754, 40.9621),
-    ("Río Tormes", -5.6610, 40.9515),
+const LANDMARKS: [(&str, &str, f64, f64); 4] = [
+    ("Plaza Mayor", "Plaza Mayor", -5.6640, 40.9650),
+    ("Estación de tren", "Train station", -5.6487, 40.9722),
+    ("Hospital", "Hospital", -5.6754, 40.9621),
+    ("Río Tormes", "Tormes river", -5.6610, 40.9515),
 ];
 
 #[derive(Clone, Copy, PartialEq)]
@@ -159,6 +203,24 @@ enum Hit {
     Result(usize),
     Favourite(usize),
     Line(Option<String>),
+    Palette,
+    Command(usize),
+}
+
+#[derive(Clone, Copy)]
+enum Command {
+    Go(Tab),
+    Refresh,
+    Replay,
+    Theme,
+    Language,
+    Quit,
+}
+
+#[derive(Default)]
+struct Palette {
+    query: String,
+    selected: usize,
 }
 
 /// What the UI wants fetched, and what the worker has fetched.
@@ -171,7 +233,7 @@ struct Shared {
     /// Where each vehicle has been since the map was opened, oldest first.
     trails: HashMap<String, Vec<Point>>,
     arrivals: HashMap<String, (Instant, Vec<Arrival>)>,
-    error: Option<String>,
+    error: Option<api::Error>,
 }
 
 /// River and roads from OpenStreetMap, drawn under the stops.
@@ -207,9 +269,23 @@ struct App {
     mouse: Option<Position>,
     /// When the bus on the Paradas tab was first shown: its animation runs from here.
     bus_since: Option<Instant>,
+    palette: Option<Palette>,
 }
 
 pub fn run(client: Client) -> io::Result<()> {
+    let settings = load_settings();
+    let english = match settings.lang.as_deref() {
+        Some("en") => true,
+        Some("es") => false,
+        _ => !system_spanish(),
+    };
+    ENGLISH.store(english, Relaxed);
+    let light = match settings.theme.as_deref() {
+        Some("light") => true,
+        Some("dark") => false,
+        _ => system_light(),
+    };
+    LIGHT.store(light, Relaxed);
     let favourites = load_favourites();
     let shared = Arc::new(Mutex::new(Shared {
         tab: if favourites.is_empty() {
@@ -242,6 +318,7 @@ pub fn run(client: Client) -> io::Result<()> {
         hits: vec![],
         mouse: None,
         bus_since: None,
+        palette: None,
     };
     let mut terminal = ratatui::init();
     // ratatui's panic hook restores the screen but leaves mouse reporting on.
@@ -306,8 +383,7 @@ fn worker(client: &Client, shared: &Mutex<Shared>) {
                     .insert(key.clone(), (Instant::now(), arrivals));
             })
         }
-        .err()
-        .map(|e| e.to_string());
+        .err();
         fetched.insert(key, Instant::now());
         shared.lock().unwrap().error = error;
     }
@@ -340,6 +416,21 @@ impl App {
         match mouse.kind {
             MouseEventKind::ScrollDown => self.on_key(KeyCode::Down.into()),
             MouseEventKind::ScrollUp => self.on_key(KeyCode::Up.into()),
+            MouseEventKind::Down(MouseButton::Left) if self.palette.is_some() => {
+                // Nothing under the palette takes the click: outside it, the click only closes it.
+                let hit = self.hits.iter().rev().find(|(rect, _)| rect.contains(at));
+                match hit.map(|(_, hit)| hit.clone()) {
+                    Some(Hit::Command(i)) => {
+                        self.palette = None;
+                        return self
+                            .palette_commands()
+                            .get(i)
+                            .is_some_and(|&(c, ..)| self.run(c));
+                    }
+                    _ => self.palette = None,
+                }
+                false
+            }
             MouseEventKind::Down(MouseButton::Left) => {
                 let hit = self
                     .hits
@@ -357,7 +448,8 @@ impl App {
                     Some(Hit::Result(i)) => self.results.select(Some(i)),
                     Some(Hit::Favourite(i)) => self.selected = i,
                     Some(Hit::Line(line)) => self.line = line,
-                    None => {}
+                    Some(Hit::Palette) => self.palette = Some(Palette::default()),
+                    Some(Hit::Command(_)) | None => {}
                 }
                 false
             }
@@ -367,8 +459,19 @@ impl App {
 
     /// Returns true to quit.
     fn on_key(&mut self, key: KeyEvent) -> bool {
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl && key.code == KeyCode::Char('c') {
             return true;
+        }
+        if ctrl && key.code == KeyCode::Char('p') {
+            self.palette = match self.palette {
+                Some(_) => None,
+                None => Some(Palette::default()),
+            };
+            return false;
+        }
+        if self.palette.is_some() {
+            return self.on_palette_key(key.code);
         }
         let shared = self.shared.clone();
         let mut s = shared.lock().unwrap();
@@ -440,6 +543,107 @@ impl App {
         false
     }
 
+    /// Returns true to quit.
+    fn on_palette_key(&mut self, code: KeyCode) -> bool {
+        let found = self.palette_commands();
+        let Some(p) = self.palette.as_mut() else {
+            return false;
+        };
+        match code {
+            KeyCode::Esc => self.palette = None,
+            KeyCode::Down => p.selected = (p.selected + 1).min(found.len().saturating_sub(1)),
+            KeyCode::Up => p.selected = p.selected.saturating_sub(1),
+            KeyCode::Backspace => {
+                p.query.pop();
+                p.selected = 0;
+            }
+            KeyCode::Char(c) => {
+                p.query.push(c);
+                p.selected = 0;
+            }
+            KeyCode::Enter => {
+                let chosen = found.get(p.selected).map(|&(c, ..)| c);
+                self.palette = None;
+                return chosen.is_some_and(|c| self.run(c));
+            }
+            _ => {}
+        }
+        false
+    }
+
+    /// The commands whose name matches what is typed in the palette: (command, name, key).
+    fn palette_commands(&self) -> Vec<(Command, String, &'static str)> {
+        let theme_name = if LIGHT.load(Relaxed) {
+            tr("Modo oscuro", "Dark mode")
+        } else {
+            tr("Modo claro", "Light mode")
+        };
+        let all = [
+            (
+                Command::Go(Tab::Stops),
+                tr("Ir a Paradas", "Go to Stops"),
+                "",
+            ),
+            (
+                Command::Go(Tab::Arrivals),
+                tr("Ir a Llegadas", "Go to Arrivals"),
+                "",
+            ),
+            (Command::Go(Tab::Map), tr("Ir al Mapa", "Go to Map"), ""),
+            (Command::Refresh, tr("Actualizar ahora", "Refresh now"), "r"),
+            (
+                Command::Replay,
+                tr("Ver llegar el autobús", "Watch the bus pull in"),
+                "",
+            ),
+            (Command::Theme, theme_name, ""),
+            (
+                Command::Language,
+                tr("English (cambiar idioma)", "Español (change language)"),
+                "",
+            ),
+            (Command::Quit, tr("Salir", "Quit"), "q"),
+        ];
+        let query = self
+            .palette
+            .as_ref()
+            .map_or(String::new(), |p| api::fold(&p.query));
+        all.into_iter()
+            .filter(|(_, name, _)| api::fold(name).contains(&query))
+            .map(|(c, name, key)| (c, name.to_owned(), key))
+            .collect()
+    }
+
+    /// Returns true to quit.
+    fn run(&mut self, command: Command) -> bool {
+        let mut s = self.shared.lock().unwrap();
+        match command {
+            Command::Go(tab) => s.tab = tab,
+            Command::Refresh => s.refresh = true,
+            Command::Replay => {
+                self.query.clear();
+                self.bus_since = None;
+                s.tab = Tab::Stops;
+            }
+            Command::Theme => {
+                let light = !LIGHT.load(Relaxed);
+                LIGHT.store(light, Relaxed);
+                let mut settings = load_settings();
+                settings.theme = Some(if light { "light" } else { "dark" }.to_owned());
+                save_settings(&settings);
+            }
+            Command::Language => {
+                let english = !ENGLISH.load(Relaxed);
+                ENGLISH.store(english, Relaxed);
+                let mut settings = load_settings();
+                settings.lang = Some(if english { "en" } else { "es" }.to_owned());
+                save_settings(&settings);
+            }
+            Command::Quit => return true,
+        }
+        false
+    }
+
     /// A row of clickable groups of spans, laid out left to right. The one under the mouse lights up.
     fn buttons(
         &mut self,
@@ -461,7 +665,7 @@ impl App {
             line.extend(
                 spans
                     .into_iter()
-                    .map(|span| if hot { span.bg(THEME.panel) } else { span }),
+                    .map(|span| if hot { span.bg(theme().panel) } else { span }),
             );
             self.hits.extend(hit.map(|hit| (rect, hit)));
         }
@@ -469,7 +673,7 @@ impl App {
     }
 
     fn draw(&mut self, frame: &mut Frame) {
-        let t = &*THEME;
+        let t = theme();
         self.hits.clear();
         frame.render_widget(
             Block::new().style(Style::new().bg(t.bg).fg(t.fg)),
@@ -489,9 +693,9 @@ impl App {
 
         let mut top = vec![(vec!["salbus".fg(t.primary).bold(), "   ".into()], None)];
         for (tab, name) in [
-            (Tab::Stops, "Paradas"),
-            (Tab::Arrivals, "Llegadas"),
-            (Tab::Map, "Mapa"),
+            (Tab::Stops, tr("Paradas", "Stops")),
+            (Tab::Arrivals, tr("Llegadas", "Arrivals")),
+            (Tab::Map, tr("Mapa", "Map")),
         ] {
             let label = format!(" {name} ");
             let label = if tab == s.tab {
@@ -511,32 +715,36 @@ impl App {
             Tab::Map => s.positions_at,
         };
         let live = match freshest {
-            _ if s.tab == Tab::Stops => format!("{} paradas", self.stops.len()).fg(t.muted),
-            Some(at) if at.elapsed() < Duration::from_secs(90) => "● en vivo".fg(t.success),
-            Some(_) => "● datos viejos".fg(t.warning),
-            None => "○ cargando…".fg(t.muted),
+            _ if s.tab == Tab::Stops => {
+                format!("{} {}", self.stops.len(), tr("paradas", "stops")).fg(t.muted)
+            }
+            Some(at) if at.elapsed() < Duration::from_secs(90) => {
+                tr("● en vivo", "● live").fg(t.success)
+            }
+            Some(_) => tr("● datos viejos", "● stale data").fg(t.warning),
+            None => tr("○ cargando…", "○ loading…").fg(t.muted),
         };
         frame.render_widget(Line::from(live).right_aligned(), header.inner(padded));
 
-        let hints: &[(&str, &str, KeyCode)] = match s.tab {
-            Tab::Stops => &[
-                ("↑↓", "elegir", KeyCode::Down),
-                ("enter", "guardar parada", KeyCode::Enter),
-                ("tab", "llegadas", KeyCode::Tab),
-                ("esc", "salir", KeyCode::Esc),
+        let hints: Vec<(&str, &str, KeyCode)> = match s.tab {
+            Tab::Stops => vec![
+                ("↑↓", tr("elegir", "choose"), KeyCode::Down),
+                ("enter", tr("guardar parada", "save stop"), KeyCode::Enter),
+                ("tab", tr("llegadas", "arrivals"), KeyCode::Tab),
+                ("esc", tr("salir", "quit"), KeyCode::Esc),
             ],
-            Tab::Arrivals => &[
-                ("↑↓", "parada", KeyCode::Down),
-                ("d", "quitar", KeyCode::Char('d')),
-                ("r", "actualizar", KeyCode::Char('r')),
-                ("tab", "mapa", KeyCode::Tab),
-                ("q", "salir", KeyCode::Char('q')),
+            Tab::Arrivals => vec![
+                ("↑↓", tr("parada", "stop"), KeyCode::Down),
+                ("d", tr("quitar", "remove"), KeyCode::Char('d')),
+                ("r", tr("actualizar", "refresh"), KeyCode::Char('r')),
+                ("tab", tr("mapa", "map"), KeyCode::Tab),
+                ("q", tr("salir", "quit"), KeyCode::Char('q')),
             ],
-            Tab::Map => &[
-                ("↑↓", "línea", KeyCode::Down),
-                ("r", "actualizar", KeyCode::Char('r')),
-                ("tab", "paradas", KeyCode::Tab),
-                ("q", "salir", KeyCode::Char('q')),
+            Tab::Map => vec![
+                ("↑↓", tr("línea", "line"), KeyCode::Down),
+                ("r", tr("actualizar", "refresh"), KeyCode::Char('r')),
+                ("tab", tr("paradas", "stops"), KeyCode::Tab),
+                ("q", tr("salir", "quit"), KeyCode::Char('q')),
             ],
         };
         let mut bar: Vec<(Vec<Span>, Option<Hit>)> = hints
@@ -549,7 +757,15 @@ impl App {
                 (spans, Some(Hit::Key(*code)))
             })
             .collect();
+        bar.push((
+            vec![
+                " ctrl+p ".fg(t.accent).bold(),
+                format!("{}  ", tr("comandos", "commands")).fg(t.fg),
+            ],
+            Some(Hit::Palette),
+        ));
         if let Some(error) = &s.error {
+            let error = error.message(ENGLISH.load(Relaxed));
             bar.push((vec![format!(" {error}").fg(t.error)], None));
         }
         frame.render_widget(Block::new().style(Style::new().bg(t.surface)), footer);
@@ -562,10 +778,76 @@ impl App {
             Tab::Arrivals => self.draw_arrivals(frame, body, &s),
             Tab::Map => self.draw_map(frame, body, &s),
         }
+        drop(s);
+        if self.palette.is_some() {
+            self.draw_palette(frame);
+        }
+    }
+
+    /// A box over the middle of the screen: what is typed, then the matching commands.
+    fn draw_palette(&mut self, frame: &mut Frame) {
+        let t = theme();
+        let found = self.palette_commands();
+        let Some(p) = self.palette.as_mut() else {
+            return;
+        };
+        p.selected = p.selected.min(found.len().saturating_sub(1));
+        let screen = frame.area();
+        let width = screen.width.saturating_sub(4).min(56);
+        let height = (found.len().max(1) as u16 + 4).min(screen.height.saturating_sub(2));
+        let area = Rect {
+            x: screen.x + (screen.width - width) / 2,
+            y: screen.y + (screen.height - height) / 3,
+            width,
+            height,
+        };
+        frame.render_widget(Clear, area);
+        let block = panel(tr("Comandos", "Commands"), true).title_top(
+            Line::from(tr("esc cerrar ", "esc close "))
+                .fg(t.muted)
+                .right_aligned(),
+        );
+        let inner = block.inner(area).inner(Margin::new(1, 0));
+        frame.render_widget(block, area);
+        let typed = format!("› {}▏", p.query);
+        let input = Rect { height: 1, ..inner };
+        frame.render_widget(Line::from(typed.fg(t.fg)).bg(t.field), input);
+        let selected = p.selected;
+        if found.is_empty() {
+            let none = Rect {
+                y: inner.y + 2,
+                height: 1,
+                ..inner
+            };
+            frame.render_widget(
+                Line::from(tr("Ningún comando casa", "No matching command").fg(t.muted)),
+                none,
+            );
+        }
+        for (i, (_, name, key)) in found.iter().enumerate() {
+            let row = Rect {
+                y: inner.y + 2 + i as u16,
+                height: 1,
+                ..inner
+            };
+            if row.bottom() > inner.bottom() {
+                break;
+            }
+            let hot = self.mouse.is_some_and(|at| row.contains(at));
+            let style = match (i == selected, hot) {
+                (true, _) => Style::new().fg(t.bg).bg(t.primary).bold(),
+                (false, true) => Style::new().fg(t.fg).bg(t.surface),
+                (false, false) => Style::new().fg(t.fg),
+            };
+            let room = usize::from(row.width).saturating_sub(key.chars().count() + 2);
+            let text = format!(" {:<room$}{key} ", clip(name, room));
+            frame.render_widget(Line::from(Span::styled(text, style)), row);
+            self.hits.push((row, Hit::Command(i)));
+        }
     }
 
     fn draw_stops(&mut self, frame: &mut Frame, area: Rect, s: &Shared) {
-        let t = &*THEME;
+        let t = theme();
         let (left, side) = with_side_panel(area);
         // The wordmark and the bus give way to results as soon as there is something to look for.
         let hero = if self.query.is_empty() && left.height >= 30 {
@@ -589,7 +871,11 @@ impl App {
                 .collect();
             art.push(Line::default());
             art.push(Line::from(
-                "Autobuses urbanos de Salamanca, en vivo".fg(t.muted),
+                tr(
+                    "Autobuses urbanos de Salamanca, en vivo",
+                    "Salamanca city buses, live",
+                )
+                .fg(t.muted),
             ));
             frame.render_widget(Paragraph::new(art).centered(), hero);
             let street = Rect {
@@ -602,19 +888,30 @@ impl App {
 
         let width = usize::from(left.width).saturating_sub(10).min(56);
         let typed = if self.query.is_empty() {
-            format!(" {:<width$}", "nombre, calle o número").fg(t.muted)
+            format!(
+                " {:<width$}",
+                tr("nombre, calle o número", "name, street or number")
+            )
+            .fg(t.muted)
         } else {
             format!(" {:<width$}", format!("{}▏", self.query)).fg(t.fg)
         };
         frame.render_widget(
-            Line::from(vec!["Parada   ".fg(t.muted), typed.bg(t.field)]),
+            Line::from(vec![
+                format!("{:<9}", tr("Parada", "Stop")).fg(t.muted),
+                typed.bg(t.field),
+            ]),
             input,
         );
 
         let found = api::search(&self.stops, &self.query);
         let help = format!(
-            "{} paradas. Elige una con las flechas o el ratón.",
-            found.len()
+            "{} {}",
+            found.len(),
+            tr(
+                "paradas. Elige una con las flechas o el ratón.",
+                "stops. Pick one with the arrows or the mouse.",
+            )
         );
         frame.render_widget(Line::from(help.fg(t.muted)), count);
 
@@ -692,7 +989,7 @@ impl App {
         let Some(side) = side else { return };
         let stop = self.results.selected().and_then(|i| found.get(i));
         let everything: Vec<Point> = self.stops.iter().filter_map(point).collect();
-        let title = stop.map_or("Mapa".to_owned(), |stop| {
+        let title = stop.map_or(tr("Mapa", "Map").to_owned(), |stop| {
             format!("{} · {}", stop.id, stop.name)
         });
         let labels = stop
@@ -726,27 +1023,34 @@ impl App {
             ..area
         };
         frame.render_widget(
-            Line::from("▀".repeat(area.width.into()).fg(THEME.road)),
+            Line::from("▀".repeat(area.width.into()).fg(theme().road)),
             road,
         );
     }
 
     fn draw_arrivals(&mut self, frame: &mut Frame, area: Rect, s: &Shared) {
-        let t = &*THEME;
+        let t = theme();
         if s.favourites.is_empty() {
             let (tab, enter) = ("tab".fg(t.accent).bold(), "enter".fg(t.accent).bold());
             let how = vec![
-                "Pulsa ".into(),
+                tr("Pulsa ", "Press ").into(),
                 tab,
-                " hasta «Paradas», busca una y pulsa ".into(),
+                tr(
+                    " hasta «Paradas», busca una y pulsa ",
+                    " until «Stops», find one and press ",
+                )
+                .into(),
                 enter,
                 ".".into(),
             ];
             let help = vec![
                 Line::default(),
-                Line::from("Aún no has guardado ninguna parada.")
-                    .bold()
-                    .centered(),
+                Line::from(tr(
+                    "Aún no has guardado ninguna parada.",
+                    "You have not saved any stop yet.",
+                ))
+                .bold()
+                .centered(),
                 Line::default(),
                 Line::from(how).fg(t.muted).centered(),
             ];
@@ -791,8 +1095,8 @@ impl App {
                 .find(|stop| stop.id == *id)
                 .map_or("", |stop| stop.name.as_str());
             let fetched = s.arrivals.get(id);
-            let age = fetched.map_or("cargando…".to_owned(), |(at, _)| {
-                format!("hace {} s", at.elapsed().as_secs())
+            let age = fetched.map_or(tr("cargando…", "loading…").to_owned(), |(at, _)| {
+                ago(*at)
             });
             let block = panel(&format!("★ {id} · {name}"), i == self.selected)
                 .title_top(Line::from(format!("{age} ")).fg(t.muted).right_aligned());
@@ -800,7 +1104,11 @@ impl App {
             let rows: Vec<Line> = match fetched {
                 None => vec![],
                 Some((_, list)) if list.is_empty() => {
-                    vec![" sin autobuses previstos".fg(t.muted).into()]
+                    vec![
+                        tr(" sin autobuses previstos", " no buses expected")
+                            .fg(t.muted)
+                            .into(),
+                    ]
                 }
                 Some((_, list)) => list
                     .iter()
@@ -850,11 +1158,16 @@ impl App {
             labels,
             ..City::default()
         };
-        self.draw_city(frame, side, panel("Autobuses en camino", false), city);
+        self.draw_city(
+            frame,
+            side,
+            panel(tr("Autobuses en camino", "Buses on their way"), false),
+            city,
+        );
     }
 
     fn draw_map(&mut self, frame: &mut Frame, area: Rect, s: &Shared) {
-        let t = &*THEME;
+        let t = theme();
         let on_line = |line: &str| self.line.as_deref().is_none_or(|l| l == line);
         let vehicles: Vec<&Vehicle> = s.positions.iter().filter(|v| on_line(&v.line)).collect();
         let everything: Vec<Point> = self.stops.iter().filter_map(point).collect();
@@ -902,16 +1215,31 @@ impl App {
         } else {
             (area, None)
         };
-        let age = s.positions_at.map_or("cargando…".to_owned(), |at| {
-            format!("hace {} s", at.elapsed().as_secs())
-        });
+        let age = s
+            .positions_at
+            .map_or(tr("cargando…", "loading…").to_owned(), ago);
         let title = match &self.line {
-            Some(line) => format!("Línea {line} · {} autobuses", vehicles.len()),
-            None => format!("Salamanca · {} autobuses", vehicles.len()),
+            Some(line) => format!(
+                "{} {line} · {} {}",
+                tr("Línea", "Line"),
+                vehicles.len(),
+                tr("autobuses", "buses")
+            ),
+            None => format!(
+                "Salamanca · {} {}",
+                vehicles.len(),
+                tr("autobuses", "buses")
+            ),
         };
         let key = match self.line {
-            Some(_) => " → en marcha   ● parado   ★ parada guardada",
-            None => " número = línea del autobús   ★ parada guardada",
+            Some(_) => tr(
+                " → en marcha   ● parado   ★ parada guardada",
+                " → moving   ● stopped   ★ saved stop",
+            ),
+            None => tr(
+                " número = línea del autobús   ★ parada guardada",
+                " number = the bus's line   ★ saved stop",
+            ),
         };
         let block = panel(&title, false)
             .title_top(Line::from(format!("{age} ")).fg(t.muted).right_aligned())
@@ -928,13 +1256,13 @@ impl App {
         self.draw_city(frame, map, block, city);
 
         let Some(side) = side else { return };
-        let block = panel("Líneas en servicio", false);
+        let block = panel(tr("Líneas en servicio", "Lines running"), false);
         let inner = block.inner(side);
         let on_road = lines_on_road(&s.positions);
         let mut entries = vec![(
             None,
             "    ".into(),
-            "Todas las líneas".to_owned(),
+            tr("Todas las líneas", "All lines").to_owned(),
             s.positions.len(),
         )];
         entries.extend(on_road.into_iter().map(|(line, name, buses)| {
@@ -974,7 +1302,7 @@ impl App {
 
     /// City map: roads and river, stop dots, highlighted stops, trails, then labels on top.
     fn draw_city(&self, frame: &mut Frame, area: Rect, block: Block, city: City) {
-        let t = &*THEME;
+        let t = theme();
         let inner = block.inner(area);
         let (x_bounds, y_bounds) = fit(city.focus, inner);
         // Labels are drawn from their left edge; nudge them so they sit on the point.
@@ -1015,7 +1343,8 @@ impl App {
                 });
                 // Zoomed out to the whole network the names would sit on top of each other.
                 let places = if cell < 0.0015 { &LANDMARKS[..] } else { &[] };
-                for &(name, lon, lat) in places {
+                for &(es, en, lon, lat) in places {
+                    let name = tr(es, en);
                     let shift = cell * (name.chars().count() as f64) / 2.0;
                     ctx.print(lon - shift, lat, name.fg(t.stop).italic());
                 }
@@ -1061,39 +1390,42 @@ fn draw_sprite(
 }
 
 /// `spoke` is which of a hub's four pixels is lit, so the wheels turn; `open` is the doors.
+/// The bus keeps its own colours in both themes; only the sign's frame follows the theme.
 fn sprite_colour(pixel: u8, x: usize, y: usize, spoke: usize, open: bool) -> Option<Color> {
-    let t = &*THEME;
-    Some(match pixel {
-        b'B' => t.primary,
-        b'D' => t.river,
-        b'W' => t.accent,
-        b'd' if open => t.panel,
-        b'd' => t.accent,
-        b'i' if open => t.panel,
-        b'i' => t.primary,
-        b'L' => t.fg,
-        b'S' => t.panel,
-        b'A' => t.warning,
-        b'T' => t.error,
-        b'K' => t.muted,
-        b'P' => t.muted,
+    let hex = match pixel {
+        b'F' => return Some(theme().fg),
+        b'B' => 0x3f9de3,
+        b'i' if !open => 0x3f9de3,
+        b'D' => 0x2f6ea8,
+        b'W' => 0x9dcff5,
+        b'd' if !open => 0x9dcff5,
+        b'd' | b'i' | b'S' => 0x1e2941,
+        b'L' => 0xe4e9f2,
+        b'A' => 0xe0b25c,
+        b'T' => 0xe0675c,
+        b'K' | b'P' => 0x8d97ab,
         b'H' => {
             // The hub's pixels clockwise from the top left; the wheels are 19 apart.
             let (dx, dy) = ((x + 11) % 19, y - 11);
             let clockwise = if dy == 0 { dx } else { 3 - dx };
-            if clockwise == spoke { t.fg } else { t.stop }
+            if clockwise == spoke {
+                0xe4e9f2
+            } else {
+                0x65708a
+            }
         }
         _ => return None,
-    })
+    };
+    Some(rgb(hex))
 }
 
 fn arrival_row(a: &Arrival, now: i64, width: usize) -> Line<'static> {
     const BAR: usize = 14;
     const BAR_MINUTES: usize = 20;
-    let t = &*THEME;
+    let t = theme();
     let minutes = a.expected_epoch.map(|e| api::minutes_until(e, now));
     let (eta, eta_colour) = match minutes {
-        Some(0) => ("llegando".to_owned(), t.success),
+        Some(0) => (tr("llegando", "arriving").to_owned(), t.success),
         Some(m) if m <= 2 => (format!("{m} min"), t.success),
         Some(m) if m <= 6 => (format!("{m} min"), t.warning),
         Some(m) => (format!("{m} min"), t.fg),
@@ -1172,19 +1504,25 @@ fn line_colour(line: &str) -> Color {
         "92" => 0x9a80ac,
         _ => 0x8f8a80,
     };
-    colour(hex, THEME.truecolor)
+    if !LIGHT.load(Relaxed) {
+        return rgb(hex);
+    }
+    // The same hues, darkened to read on a light background.
+    let [_, r, g, b] = hex.to_be_bytes();
+    let dark = |v: u8| u32::from(v) * 7 / 10;
+    rgb(dark(r) << 16 | dark(g) << 8 | dark(b))
 }
 
 fn badge(line: &str) -> Span<'static> {
     Span::styled(
         format!(" {line:>2} "),
-        Style::new().bg(line_colour(line)).fg(THEME.bg).bold(),
+        Style::new().bg(line_colour(line)).fg(theme().bg).bold(),
     )
 }
 
 /// A flat surface titled on its first row, no borders.
 fn panel(title: &str, active: bool) -> Block<'static> {
-    let t = &*THEME;
+    let t = theme();
     let (surface, text) = if active {
         (t.panel, t.primary)
     } else {
@@ -1271,11 +1609,71 @@ fn fit(points: &[Point], area: Rect) -> ([f64; 2], [f64; 2]) {
     )
 }
 
-fn favourites_path() -> Option<PathBuf> {
+fn config_file(name: &str) -> Option<PathBuf> {
     let config = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
-    Some(config.join("salbus").join("favourites.json"))
+    Some(config.join("salbus").join(name))
+}
+
+fn favourites_path() -> Option<PathBuf> {
+    config_file("favourites.json")
+}
+
+/// Only what the user picked; anything left out follows the system.
+#[derive(Default, Serialize, Deserialize)]
+struct Settings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    theme: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lang: Option<String>,
+}
+
+fn load_settings() -> Settings {
+    config_file("settings.json")
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+fn save_settings(settings: &Settings) {
+    let Some(path) = config_file("settings.json") else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let _ = fs::write(path, serde_json::to_string(settings).unwrap_or_default());
+}
+
+/// The locale variables first; if none says a language, macOS's preferred languages.
+fn system_spanish() -> bool {
+    let locale = ["LC_ALL", "LC_MESSAGES", "LANG"]
+        .iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .find(|v| !v.is_empty() && v != "C" && v != "POSIX" && !v.starts_with("C."));
+    if let Some(locale) = locale {
+        return locale.starts_with("es");
+    }
+    cfg!(target_os = "macos")
+        && std::process::Command::new("defaults")
+            .args(["read", "-g", "AppleLanguages"])
+            .output()
+            .is_ok_and(|out| {
+                let text = String::from_utf8_lossy(&out.stdout);
+                text.split('"')
+                    .nth(1)
+                    .is_some_and(|first| first.starts_with("es"))
+            })
+}
+
+/// macOS's appearance setting; dark anywhere else, or if it cannot be read.
+fn system_light() -> bool {
+    cfg!(target_os = "macos")
+        && std::process::Command::new("defaults")
+            .args(["read", "-g", "AppleInterfaceStyle"])
+            .output()
+            .is_ok_and(|out| !String::from_utf8_lossy(&out.stdout).contains("Dark"))
 }
 
 fn load_favourites() -> Vec<String> {

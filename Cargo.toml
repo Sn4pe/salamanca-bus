@@ -1,0 +1,18 @@
+[package]
+name = "salamanca-bus"
+version = "0.1.0"
+edition = "2024"
+description = "Autobuses urbanos de Salamanca en tiempo real: CLI JSON y TUI. No oficial."
+license = "MIT"
+repository = "https://github.com/Sn4pe/salamanca-bus"
+
+[[bin]]
+name = "salbus"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.6.9", features = ["derive"] }
+ratatui = "0.30.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+ureq = { version = "3.5.2", features = ["json"] }

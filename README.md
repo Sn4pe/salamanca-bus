@@ -60,8 +60,11 @@ o más cada pestaña añade un panel lateral.
   `↑` `↓` eligen parada, `d` la quita, `r` refresca ya.
 - **Mapa:** calles, río, paradas y autobuses en vivo, refrescado cada 5 s. Cada autobús es el
   número de su línea, sobre el centro de la ciudad (las paradas más alejadas quedan fuera).
-  `↑` `↓` eligen línea: el mapa encuadra su recorrido entero y cada autobús añade una flecha con
-  su rumbo (un punto si está parado) y deja estela.
+  La rueda acerca o aleja donde está el ratón, y arrastrar lo mueve; con teclado, `+` `-` para el
+  zoom, `w` `a` `s` `d` para moverlo y `0` para volver a encuadrar. Al acercarse aparecen todas las
+  calles, la flecha con el rumbo de cada autobús y, muy cerca, el número de cada parada.
+  `↑` `↓`, o un clic en la leyenda, eligen línea: el mapa encuadra su recorrido entero y cada
+  autobús añade su rumbo (un punto si está parado) y deja estela.
 - **Paleta de comandos** (`ctrl+p`, o clic en el atajo del pie): escribe para filtrar. Cambia de
   pestaña, actualiza, repite la llegada del autobús, cambia de tema o de idioma y sale.
 
@@ -101,9 +104,9 @@ cargo test
 
 Los datos de paradas incluidos (`data/stops.json`) son la respuesta de la API el 20 nov 2026.
 
-El mapa base (`data/basemap.json`: río Tormes y vías principales, simplificados) viene de
+El mapa base (`data/basemap.json`: río Tormes, vías principales y calles, simplificados) viene de
 [OpenStreetMap](https://www.openstreetmap.org/copyright), © colaboradores de OpenStreetMap, bajo
-licencia ODbL. Descargado con Overpass el 20 nov 2026; `tools/basemap.py` lo regenera.
+licencia ODbL. Descargado con Overpass el 21 nov 2026; `tools/basemap.py` lo regenera.
 
 ## Licencia
 

@@ -306,7 +306,7 @@ fn haystack(name: &str) -> String {
     format!("{folded} {spelled}")
 }
 
-fn fold(s: &str) -> String {
+pub fn fold(s: &str) -> String {
     s.to_lowercase()
         .chars()
         .map(|c| match c {

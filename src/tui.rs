@@ -16,7 +16,7 @@ use ratatui::style::{Color, Style, Stylize};
 use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::canvas::{Canvas, Line as Segment, Points};
-use ratatui::widgets::{Block, List, ListState, Paragraph};
+use ratatui::widgets::{Block, Clear, List, ListState, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 use serde::Deserialize;
 
@@ -159,6 +159,22 @@ enum Hit {
     Result(usize),
     Favourite(usize),
     Line(Option<String>),
+    Palette,
+    Command(usize),
+}
+
+#[derive(Clone, Copy)]
+enum Command {
+    Go(Tab),
+    Refresh,
+    Replay,
+    Quit,
+}
+
+#[derive(Default)]
+struct Palette {
+    query: String,
+    selected: usize,
 }
 
 /// What the UI wants fetched, and what the worker has fetched.
@@ -207,6 +223,7 @@ struct App {
     mouse: Option<Position>,
     /// When the bus on the Paradas tab was first shown: its animation runs from here.
     bus_since: Option<Instant>,
+    palette: Option<Palette>,
 }
 
 pub fn run(client: Client) -> io::Result<()> {
@@ -242,6 +259,7 @@ pub fn run(client: Client) -> io::Result<()> {
         hits: vec![],
         mouse: None,
         bus_since: None,
+        palette: None,
     };
     let mut terminal = ratatui::init();
     // ratatui's panic hook restores the screen but leaves mouse reporting on.
@@ -340,6 +358,21 @@ impl App {
         match mouse.kind {
             MouseEventKind::ScrollDown => self.on_key(KeyCode::Down.into()),
             MouseEventKind::ScrollUp => self.on_key(KeyCode::Up.into()),
+            MouseEventKind::Down(MouseButton::Left) if self.palette.is_some() => {
+                // Nothing under the palette takes the click: outside it, the click only closes it.
+                let hit = self.hits.iter().rev().find(|(rect, _)| rect.contains(at));
+                match hit.map(|(_, hit)| hit.clone()) {
+                    Some(Hit::Command(i)) => {
+                        self.palette = None;
+                        return self
+                            .palette_commands()
+                            .get(i)
+                            .is_some_and(|&(c, ..)| self.run(c));
+                    }
+                    _ => self.palette = None,
+                }
+                false
+            }
             MouseEventKind::Down(MouseButton::Left) => {
                 let hit = self
                     .hits
@@ -357,7 +390,8 @@ impl App {
                     Some(Hit::Result(i)) => self.results.select(Some(i)),
                     Some(Hit::Favourite(i)) => self.selected = i,
                     Some(Hit::Line(line)) => self.line = line,
-                    None => {}
+                    Some(Hit::Palette) => self.palette = Some(Palette::default()),
+                    Some(Hit::Command(_)) | None => {}
                 }
                 false
             }
@@ -367,8 +401,19 @@ impl App {
 
     /// Returns true to quit.
     fn on_key(&mut self, key: KeyEvent) -> bool {
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl && key.code == KeyCode::Char('c') {
             return true;
+        }
+        if ctrl && key.code == KeyCode::Char('p') {
+            self.palette = match self.palette {
+                Some(_) => None,
+                None => Some(Palette::default()),
+            };
+            return false;
+        }
+        if self.palette.is_some() {
+            return self.on_palette_key(key.code);
         }
         let shared = self.shared.clone();
         let mut s = shared.lock().unwrap();
@@ -436,6 +481,70 @@ impl App {
                 self.line = options[(at + step) % options.len()].clone();
             }
             _ => {}
+        }
+        false
+    }
+
+    /// Returns true to quit.
+    fn on_palette_key(&mut self, code: KeyCode) -> bool {
+        let found = self.palette_commands();
+        let Some(p) = self.palette.as_mut() else {
+            return false;
+        };
+        match code {
+            KeyCode::Esc => self.palette = None,
+            KeyCode::Down => p.selected = (p.selected + 1).min(found.len().saturating_sub(1)),
+            KeyCode::Up => p.selected = p.selected.saturating_sub(1),
+            KeyCode::Backspace => {
+                p.query.pop();
+                p.selected = 0;
+            }
+            KeyCode::Char(c) => {
+                p.query.push(c);
+                p.selected = 0;
+            }
+            KeyCode::Enter => {
+                let chosen = found.get(p.selected).map(|&(c, ..)| c);
+                self.palette = None;
+                return chosen.is_some_and(|c| self.run(c));
+            }
+            _ => {}
+        }
+        false
+    }
+
+    /// The commands whose name matches what is typed in the palette: (command, name, key).
+    fn palette_commands(&self) -> Vec<(Command, String, &'static str)> {
+        let all = [
+            (Command::Go(Tab::Stops), "Ir a Paradas", ""),
+            (Command::Go(Tab::Arrivals), "Ir a Llegadas", ""),
+            (Command::Go(Tab::Map), "Ir al Mapa", ""),
+            (Command::Refresh, "Actualizar ahora", "r"),
+            (Command::Replay, "Ver llegar el autobús", ""),
+            (Command::Quit, "Salir", "q"),
+        ];
+        let query = self
+            .palette
+            .as_ref()
+            .map_or(String::new(), |p| api::fold(&p.query));
+        all.into_iter()
+            .filter(|(_, name, _)| api::fold(name).contains(&query))
+            .map(|(c, name, key)| (c, name.to_owned(), key))
+            .collect()
+    }
+
+    /// Returns true to quit.
+    fn run(&mut self, command: Command) -> bool {
+        let mut s = self.shared.lock().unwrap();
+        match command {
+            Command::Go(tab) => s.tab = tab,
+            Command::Refresh => s.refresh = true,
+            Command::Replay => {
+                self.query.clear();
+                self.bus_since = None;
+                s.tab = Tab::Stops;
+            }
+            Command::Quit => return true,
         }
         false
     }
@@ -549,6 +658,10 @@ impl App {
                 (spans, Some(Hit::Key(*code)))
             })
             .collect();
+        bar.push((
+            vec![" ctrl+p ".fg(t.accent).bold(), "comandos  ".fg(t.fg)],
+            Some(Hit::Palette),
+        ));
         if let Some(error) = &s.error {
             bar.push((vec![format!(" {error}").fg(t.error)], None));
         }
@@ -561,6 +674,66 @@ impl App {
             Tab::Stops => self.draw_stops(frame, body, &s),
             Tab::Arrivals => self.draw_arrivals(frame, body, &s),
             Tab::Map => self.draw_map(frame, body, &s),
+        }
+        drop(s);
+        if self.palette.is_some() {
+            self.draw_palette(frame);
+        }
+    }
+
+    /// A box over the middle of the screen: what is typed, then the matching commands.
+    fn draw_palette(&mut self, frame: &mut Frame) {
+        let t = &*THEME;
+        let found = self.palette_commands();
+        let Some(p) = self.palette.as_mut() else {
+            return;
+        };
+        p.selected = p.selected.min(found.len().saturating_sub(1));
+        let screen = frame.area();
+        let width = screen.width.saturating_sub(4).min(56);
+        let height = (found.len().max(1) as u16 + 4).min(screen.height.saturating_sub(2));
+        let area = Rect {
+            x: screen.x + (screen.width - width) / 2,
+            y: screen.y + (screen.height - height) / 3,
+            width,
+            height,
+        };
+        frame.render_widget(Clear, area);
+        let block = panel("Comandos", true)
+            .title_top(Line::from("esc cerrar ").fg(t.muted).right_aligned());
+        let inner = block.inner(area).inner(Margin::new(1, 0));
+        frame.render_widget(block, area);
+        let typed = format!("› {}▏", p.query);
+        let input = Rect { height: 1, ..inner };
+        frame.render_widget(Line::from(typed.fg(t.fg)).bg(t.field), input);
+        let selected = p.selected;
+        if found.is_empty() {
+            let none = Rect {
+                y: inner.y + 2,
+                height: 1,
+                ..inner
+            };
+            frame.render_widget(Line::from("Ningún comando casa".fg(t.muted)), none);
+        }
+        for (i, (_, name, key)) in found.iter().enumerate() {
+            let row = Rect {
+                y: inner.y + 2 + i as u16,
+                height: 1,
+                ..inner
+            };
+            if row.bottom() > inner.bottom() {
+                break;
+            }
+            let hot = self.mouse.is_some_and(|at| row.contains(at));
+            let style = match (i == selected, hot) {
+                (true, _) => Style::new().fg(t.bg).bg(t.primary).bold(),
+                (false, true) => Style::new().fg(t.fg).bg(t.surface),
+                (false, false) => Style::new().fg(t.fg),
+            };
+            let room = usize::from(row.width).saturating_sub(key.chars().count() + 2);
+            let text = format!(" {:<room$}{key} ", clip(name, room));
+            frame.render_widget(Line::from(Span::styled(text, style)), row);
+            self.hits.push((row, Hit::Command(i)));
         }
     }
 

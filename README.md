@@ -53,7 +53,8 @@ leyenda o un atajo del pie; la rueda mueve la selección. `Tab` cambia de pesta�
 o más cada pestaña añade un panel lateral.
 
 - **Paradas:** escribe para buscar. `Enter`, o un segundo clic sobre la parada elegida, la guarda
-  y salta a Llegadas. Al lado, dónde cae la parada en la ciudad.
+  y salta a Llegadas. Al lado, dónde cae la parada en la ciudad. Con el buscador vacío, un autobús
+  llega a la parada al abrir la pestaña.
 - **Llegadas:** una tarjeta por parada guardada, refrescada cada 30 s. La barra se llena según se
   acerca el autobús. Al lado, un mapa con los autobuses que vienen hacia la parada elegida.
   `↑` `↓` eligen parada, `d` la quita, `r` refresca ya.
@@ -61,13 +62,22 @@ o más cada pestaña añade un panel lateral.
   número de su línea, sobre el centro de la ciudad (las paradas más alejadas quedan fuera).
   `↑` `↓` eligen línea: el mapa encuadra su recorrido entero y cada autobús añade una flecha con
   su rumbo (un punto si está parado) y deja estela.
+- **Paleta de comandos** (`ctrl+p`, o clic en el atajo del pie): escribe para filtrar. Cambia de
+  pestaña, actualiza, repite la llegada del autobús, cambia de tema o de idioma y sale.
 
-La interfaz pinta su propio fondo oscuro, con el azul de la web oficial como color de marca. Cada
-línea tiene su propio color, apagado para que no deslumbre, y lleva siempre su número. Se ve mejor
-con color de 24 bits (`COLORTERM=truecolor`); sin él cae a 256 colores. Usa caracteres braille,
-que cualquier terminal moderno trae.
+La interfaz está en español o en inglés. Al arrancar sigue `LC_ALL`, `LC_MESSAGES` o `LANG`, y si
+no dicen nada, los idiomas de macOS; cualquier idioma que no sea español da inglés. Tiene modo
+oscuro y claro: al arrancar sigue la apariencia de macOS, y en otros sistemas empieza en oscuro.
+Lo que elijas en la paleta se recuerda. Las paradas, destinos y nombres de línea vienen de la API
+en español, y los comandos JSON hablan siempre español.
 
-Las paradas guardadas viven en `~/.config/salbus/favourites.json` (o `$XDG_CONFIG_HOME`).
+Pinta su propio fondo, con el azul de la web oficial como color de marca. Cada línea tiene su
+propio color, apagado para que no deslumbre, y lleva siempre su número. Se ve mejor con color de
+24 bits (`COLORTERM=truecolor`); sin él cae a 256 colores. Usa caracteres braille, que cualquier
+terminal moderno trae.
+
+Las paradas guardadas viven en `~/.config/salbus/favourites.json`, y el idioma y el tema elegidos
+en `settings.json` en la misma carpeta (o bajo `$XDG_CONFIG_HOME`).
 
 ## Lo que no hace
 

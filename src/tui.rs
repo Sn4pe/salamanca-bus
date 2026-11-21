@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use std::{fs, io, thread};
@@ -18,7 +19,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::canvas::{Canvas, Line as Segment, Points};
 use ratatui::widgets::{Block, Clear, List, ListState, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::api::{self, Arrival, Client, Stop, Vehicle};
 
@@ -56,7 +57,7 @@ const BUS: [&str; 14] = [
     "........KK.................KK...........",
 ];
 const STOP_SIGN: [&str; 14] = [
-    ".....", "LLLLL", "LBBBL", "LBBBL", "LLLLL", "..P..", "..P..", "..P..", "..P..", "..P..",
+    ".....", "FFFFF", "FBBBF", "FBBBF", "FFFFF", "..P..", "..P..", "..P..", "..P..", "..P..",
     "..P..", "..P..", "..P..", "..P..",
 ];
 const BUS_WIDTH: i32 = 40;
@@ -67,7 +68,6 @@ const DOORS_OPEN: Duration = Duration::from_millis(2300);
 
 /// Own background, so it looks the same on any terminal theme; blues from the operator's site.
 struct Theme {
-    truecolor: bool,
     bg: Color,
     surface: Color,
     panel: Color,
@@ -85,29 +85,59 @@ struct Theme {
     stop: Color,
 }
 
-static THEME: LazyLock<Theme> = LazyLock::new(|| {
-    let truecolor =
-        std::env::var("COLORTERM").is_ok_and(|v| v.contains("truecolor") || v.contains("24bit"));
-    let c = |hex| colour(hex, truecolor);
-    Theme {
-        truecolor,
-        bg: c(0x0c111d),
-        surface: c(0x141b2c),
-        panel: c(0x1e2941),
-        field: c(0x1a2b4b),
-        fg: c(0xe4e9f2),
-        muted: c(0x8d97ab),
-        primary: c(0x3f9de3), // the site's button blue, a touch softer
-        accent: c(0x9dcff5),
-        success: c(0x8fc48a),
-        warning: c(0xe0b25c),
-        error: c(0xe0675c),
-        river: c(0x2f6ea8),
-        road: c(0x3b4459),
-        road_minor: c(0x252d3f),
-        stop: c(0x65708a),
-    }
+static TRUECOLOR: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var("COLORTERM").is_ok_and(|v| v.contains("truecolor") || v.contains("24bit"))
 });
+static LIGHT: AtomicBool = AtomicBool::new(false);
+
+static DARK_THEME: LazyLock<Theme> = LazyLock::new(|| Theme {
+    bg: rgb(0x0c111d),
+    surface: rgb(0x141b2c),
+    panel: rgb(0x1e2941),
+    field: rgb(0x1a2b4b),
+    fg: rgb(0xe4e9f2),
+    muted: rgb(0x8d97ab),
+    primary: rgb(0x3f9de3), // the site's button blue, a touch softer
+    accent: rgb(0x9dcff5),
+    success: rgb(0x8fc48a),
+    warning: rgb(0xe0b25c),
+    error: rgb(0xe0675c),
+    river: rgb(0x2f6ea8),
+    road: rgb(0x3b4459),
+    road_minor: rgb(0x252d3f),
+    stop: rgb(0x65708a),
+});
+
+static LIGHT_THEME: LazyLock<Theme> = LazyLock::new(|| Theme {
+    bg: rgb(0xf4f7fb),
+    surface: rgb(0xe9eef6),
+    panel: rgb(0xd6e0ee),
+    // Not lighter: in 256 colours it would land on the same grey as `panel`.
+    field: rgb(0xcfdcef),
+    fg: rgb(0x1b2333),
+    muted: rgb(0x5f6b80),
+    primary: rgb(0x1a73c2),
+    accent: rgb(0x0d4f8f),
+    success: rgb(0x2e6b34),
+    warning: rgb(0x8f5300),
+    error: rgb(0xb3261e),
+    river: rgb(0x5a9bd8),
+    road: rgb(0xb3bccb),
+    road_minor: rgb(0xd3dae5),
+    stop: rgb(0x8a94a8),
+});
+
+fn theme() -> &'static Theme {
+    if LIGHT.load(Relaxed) {
+        &LIGHT_THEME
+    } else {
+        &DARK_THEME
+    }
+}
+
+fn rgb(hex: u32) -> Color {
+    colour(hex, *TRUECOLOR)
+}
 
 /// 24-bit colour where the terminal says it has it, else the nearest of the 256.
 fn colour(hex: u32, truecolor: bool) -> Color {
@@ -168,6 +198,7 @@ enum Command {
     Go(Tab),
     Refresh,
     Replay,
+    Theme,
     Quit,
 }
 
@@ -227,6 +258,12 @@ struct App {
 }
 
 pub fn run(client: Client) -> io::Result<()> {
+    let light = match load_settings().theme.as_deref() {
+        Some("light") => true,
+        Some("dark") => false,
+        _ => system_light(),
+    };
+    LIGHT.store(light, Relaxed);
     let favourites = load_favourites();
     let shared = Arc::new(Mutex::new(Shared {
         tab: if favourites.is_empty() {
@@ -515,12 +552,18 @@ impl App {
 
     /// The commands whose name matches what is typed in the palette: (command, name, key).
     fn palette_commands(&self) -> Vec<(Command, String, &'static str)> {
+        let theme_name = if LIGHT.load(Relaxed) {
+            "Modo oscuro"
+        } else {
+            "Modo claro"
+        };
         let all = [
             (Command::Go(Tab::Stops), "Ir a Paradas", ""),
             (Command::Go(Tab::Arrivals), "Ir a Llegadas", ""),
             (Command::Go(Tab::Map), "Ir al Mapa", ""),
             (Command::Refresh, "Actualizar ahora", "r"),
             (Command::Replay, "Ver llegar el autobús", ""),
+            (Command::Theme, theme_name, ""),
             (Command::Quit, "Salir", "q"),
         ];
         let query = self
@@ -543,6 +586,13 @@ impl App {
                 self.query.clear();
                 self.bus_since = None;
                 s.tab = Tab::Stops;
+            }
+            Command::Theme => {
+                let light = !LIGHT.load(Relaxed);
+                LIGHT.store(light, Relaxed);
+                let mut settings = load_settings();
+                settings.theme = Some(if light { "light" } else { "dark" }.to_owned());
+                save_settings(&settings);
             }
             Command::Quit => return true,
         }
@@ -570,7 +620,7 @@ impl App {
             line.extend(
                 spans
                     .into_iter()
-                    .map(|span| if hot { span.bg(THEME.panel) } else { span }),
+                    .map(|span| if hot { span.bg(theme().panel) } else { span }),
             );
             self.hits.extend(hit.map(|hit| (rect, hit)));
         }
@@ -578,7 +628,7 @@ impl App {
     }
 
     fn draw(&mut self, frame: &mut Frame) {
-        let t = &*THEME;
+        let t = theme();
         self.hits.clear();
         frame.render_widget(
             Block::new().style(Style::new().bg(t.bg).fg(t.fg)),
@@ -683,7 +733,7 @@ impl App {
 
     /// A box over the middle of the screen: what is typed, then the matching commands.
     fn draw_palette(&mut self, frame: &mut Frame) {
-        let t = &*THEME;
+        let t = theme();
         let found = self.palette_commands();
         let Some(p) = self.palette.as_mut() else {
             return;
@@ -738,7 +788,7 @@ impl App {
     }
 
     fn draw_stops(&mut self, frame: &mut Frame, area: Rect, s: &Shared) {
-        let t = &*THEME;
+        let t = theme();
         let (left, side) = with_side_panel(area);
         // The wordmark and the bus give way to results as soon as there is something to look for.
         let hero = if self.query.is_empty() && left.height >= 30 {
@@ -899,13 +949,13 @@ impl App {
             ..area
         };
         frame.render_widget(
-            Line::from("▀".repeat(area.width.into()).fg(THEME.road)),
+            Line::from("▀".repeat(area.width.into()).fg(theme().road)),
             road,
         );
     }
 
     fn draw_arrivals(&mut self, frame: &mut Frame, area: Rect, s: &Shared) {
-        let t = &*THEME;
+        let t = theme();
         if s.favourites.is_empty() {
             let (tab, enter) = ("tab".fg(t.accent).bold(), "enter".fg(t.accent).bold());
             let how = vec![
@@ -1027,7 +1077,7 @@ impl App {
     }
 
     fn draw_map(&mut self, frame: &mut Frame, area: Rect, s: &Shared) {
-        let t = &*THEME;
+        let t = theme();
         let on_line = |line: &str| self.line.as_deref().is_none_or(|l| l == line);
         let vehicles: Vec<&Vehicle> = s.positions.iter().filter(|v| on_line(&v.line)).collect();
         let everything: Vec<Point> = self.stops.iter().filter_map(point).collect();
@@ -1147,7 +1197,7 @@ impl App {
 
     /// City map: roads and river, stop dots, highlighted stops, trails, then labels on top.
     fn draw_city(&self, frame: &mut Frame, area: Rect, block: Block, city: City) {
-        let t = &*THEME;
+        let t = theme();
         let inner = block.inner(area);
         let (x_bounds, y_bounds) = fit(city.focus, inner);
         // Labels are drawn from their left edge; nudge them so they sit on the point.
@@ -1234,36 +1284,39 @@ fn draw_sprite(
 }
 
 /// `spoke` is which of a hub's four pixels is lit, so the wheels turn; `open` is the doors.
+/// The bus keeps its own colours in both themes; only the sign's frame follows the theme.
 fn sprite_colour(pixel: u8, x: usize, y: usize, spoke: usize, open: bool) -> Option<Color> {
-    let t = &*THEME;
-    Some(match pixel {
-        b'B' => t.primary,
-        b'D' => t.river,
-        b'W' => t.accent,
-        b'd' if open => t.panel,
-        b'd' => t.accent,
-        b'i' if open => t.panel,
-        b'i' => t.primary,
-        b'L' => t.fg,
-        b'S' => t.panel,
-        b'A' => t.warning,
-        b'T' => t.error,
-        b'K' => t.muted,
-        b'P' => t.muted,
+    let hex = match pixel {
+        b'F' => return Some(theme().fg),
+        b'B' => 0x3f9de3,
+        b'i' if !open => 0x3f9de3,
+        b'D' => 0x2f6ea8,
+        b'W' => 0x9dcff5,
+        b'd' if !open => 0x9dcff5,
+        b'd' | b'i' | b'S' => 0x1e2941,
+        b'L' => 0xe4e9f2,
+        b'A' => 0xe0b25c,
+        b'T' => 0xe0675c,
+        b'K' | b'P' => 0x8d97ab,
         b'H' => {
             // The hub's pixels clockwise from the top left; the wheels are 19 apart.
             let (dx, dy) = ((x + 11) % 19, y - 11);
             let clockwise = if dy == 0 { dx } else { 3 - dx };
-            if clockwise == spoke { t.fg } else { t.stop }
+            if clockwise == spoke {
+                0xe4e9f2
+            } else {
+                0x65708a
+            }
         }
         _ => return None,
-    })
+    };
+    Some(rgb(hex))
 }
 
 fn arrival_row(a: &Arrival, now: i64, width: usize) -> Line<'static> {
     const BAR: usize = 14;
     const BAR_MINUTES: usize = 20;
-    let t = &*THEME;
+    let t = theme();
     let minutes = a.expected_epoch.map(|e| api::minutes_until(e, now));
     let (eta, eta_colour) = match minutes {
         Some(0) => ("llegando".to_owned(), t.success),
@@ -1345,19 +1398,25 @@ fn line_colour(line: &str) -> Color {
         "92" => 0x9a80ac,
         _ => 0x8f8a80,
     };
-    colour(hex, THEME.truecolor)
+    if !LIGHT.load(Relaxed) {
+        return rgb(hex);
+    }
+    // The same hues, darkened to read on a light background.
+    let [_, r, g, b] = hex.to_be_bytes();
+    let dark = |v: u8| u32::from(v) * 7 / 10;
+    rgb(dark(r) << 16 | dark(g) << 8 | dark(b))
 }
 
 fn badge(line: &str) -> Span<'static> {
     Span::styled(
         format!(" {line:>2} "),
-        Style::new().bg(line_colour(line)).fg(THEME.bg).bold(),
+        Style::new().bg(line_colour(line)).fg(theme().bg).bold(),
     )
 }
 
 /// A flat surface titled on its first row, no borders.
 fn panel(title: &str, active: bool) -> Block<'static> {
-    let t = &*THEME;
+    let t = theme();
     let (surface, text) = if active {
         (t.panel, t.primary)
     } else {
@@ -1444,11 +1503,48 @@ fn fit(points: &[Point], area: Rect) -> ([f64; 2], [f64; 2]) {
     )
 }
 
-fn favourites_path() -> Option<PathBuf> {
+fn config_file(name: &str) -> Option<PathBuf> {
     let config = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
-    Some(config.join("salbus").join("favourites.json"))
+    Some(config.join("salbus").join(name))
+}
+
+fn favourites_path() -> Option<PathBuf> {
+    config_file("favourites.json")
+}
+
+/// Only what the user picked; anything left out follows the system.
+#[derive(Default, Serialize, Deserialize)]
+struct Settings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    theme: Option<String>,
+}
+
+fn load_settings() -> Settings {
+    config_file("settings.json")
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+fn save_settings(settings: &Settings) {
+    let Some(path) = config_file("settings.json") else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let _ = fs::write(path, serde_json::to_string(settings).unwrap_or_default());
+}
+
+/// macOS's appearance setting; dark anywhere else, or if it cannot be read.
+fn system_light() -> bool {
+    cfg!(target_os = "macos")
+        && std::process::Command::new("defaults")
+            .args(["read", "-g", "AppleInterfaceStyle"])
+            .output()
+            .is_ok_and(|out| !String::from_utf8_lossy(&out.stdout).contains("Dark"))
 }
 
 fn load_favourites() -> Vec<String> {

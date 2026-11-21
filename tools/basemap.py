@@ -1,6 +1,6 @@
-"""Rebuild data/basemap.json from OpenStreetMap: river Tormes and main roads, simplified.
+"""Rebuild data/basemap.json from OpenStreetMap: river Tormes, roads and streets, simplified.
 
-    curl -A salbus-map-build --data-urlencode 'data=[out:json][timeout:60];(way["waterway"="river"](40.925,-5.745,40.995,-5.615);way["highway"~"^(motorway|trunk|primary|secondary|tertiary)$"](40.925,-5.745,40.995,-5.615););out geom;' https://overpass-api.de/api/interpreter -o osm.json
+    curl -A salbus-map-build --data-urlencode 'data=[out:json][timeout:90];(way["waterway"="river"](40.925,-5.745,40.995,-5.615);way["highway"~"^(motorway|trunk|primary|secondary|tertiary|residential|living_street|unclassified|pedestrian)$"](40.925,-5.745,40.995,-5.615););out geom;' https://overpass-api.de/api/interpreter -o osm.json
     python3 tools/basemap.py osm.json data/basemap.json
 
 Data © OpenStreetMap contributors, ODbL.
@@ -41,6 +41,9 @@ base = {
     "river": lines(lambda t: t.get("waterway") == "river" and "Tormes" in t.get("name", "")),
     "main": lines(lambda t: t.get("highway") in ("motorway", "trunk", "primary", "secondary")),
     "minor": lines(lambda t: t.get("highway") == "tertiary"),
+    "streets": lines(
+        lambda t: t.get("highway") in ("residential", "living_street", "unclassified", "pedestrian")
+    ),
 }
 for name, found in base.items():
     print(name, len(found), "lines", sum(map(len, found)), "points")
